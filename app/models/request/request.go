@@ -1,0 +1,46 @@
+package request
+
+//请求列表通用结构体
+
+// 列表请求通用参数
+type List struct {
+	Page     int    `json:"Page" binding:"required"` // 页
+	Size     int    `json:"Size" binding:"required"` // 页数量
+	Type     int    `json:"Type"`                    // 关键字类型
+	Keywords string `json:"Keywords"`                // 关键字
+	Order    int    `json:"Order"`                   // 0 倒序 1 正序
+	Count    int64  `json:"Count"`                   // 总数缓存
+}
+
+// 单id请求
+type Id struct {
+	Id int `json:"Id" binding:"required,min=1"`
+}
+
+// 单id请求
+type Id2 struct {
+	Id int `json:"id" binding:"required,min=1"`
+}
+
+// 单id数组请求
+type Ids struct {
+	Ids []int `json:"Ids" binding:"required,min=1"` //id数组
+}
+
+// 日志列表请求（带时间范围）
+type ListLog struct {
+	List
+	RegisterTime []string `json:"RegisterTime"` // 开始时间 结束时间
+	MsgType     int      `json:"MsgType"`      // 消息类型（LogUserMsg专用）
+	AppId       int      `json:"AppId"`        // AppId筛选
+}
+
+// 列表请求通用参数
+type List2 struct {
+	Page     int    `json:"page" binding:"required"` // 页
+	Size     int    `json:"size" binding:"required"` // 页数量
+	Type     int    `json:"type"`                    // 关键字类型
+	Keywords string `json:"keywords"`                // 关键字
+	Order    int    `json:"order"`                   // 0 倒序 1 正序
+	Count    int64  `json:"count"`                   // 总数缓存
+}

@@ -1,0 +1,93 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>广告管理</title>
+<style>
+  body { margin:0; padding:20px; background:#f5f6f8; color:#1f2733; font:14px/1.6 system-ui,"PingFang SC","Microsoft YaHei",sans-serif; }
+  h1 { font-size:20px; margin:0 0 12px; }
+  .card { background:#fff; border:1px solid #e3e6eb; border-radius:10px; padding:16px; margin-bottom:12px; }
+  .form { display:flex; flex-wrap:wrap; gap:8px; align-items:center; }
+  input, select { padding:5px 8px; border:1px solid #e3e6eb; border-radius:6px; font:inherit; }
+  input.wide { flex:1; min-width:160px; } input.num { width:90px; }
+  button { border:1px solid #e3e6eb; background:#fff; border-radius:6px; padding:5px 12px; cursor:pointer; font:inherit; }
+  button.main { background:#2f6fed; border-color:#2f6fed; color:#fff; }
+  .scroll { overflow-x:auto; }
+  table { width:100%; border-collapse:collapse; white-space:nowrap; }
+  th, td { text-align:left; padding:8px; border-bottom:1px solid #e3e6eb; }
+  th { color:#6b7686; font-weight:500; }
+  #msg { color:#d03050; min-height:22px; }
+</style>
+</head>
+<body>
+<h1>广告管理</h1>
+<div class="card">
+  <div class="form">
+    <input id="title" class="wide" placeholder="标题">
+    <input id="image" class="wide" placeholder="图片地址">
+    <input id="url" class="wide" placeholder="跳转地址">
+    <input id="appId" class="num" type="number" placeholder="AppId" title="0 为全部已启用应用">
+    <input id="sort" class="num" type="number" placeholder="排序">
+    <select id="status"><option value="1">投放</option><option value="2">暂停</option></select>
+    <button class="main" id="save">保存</button>
+    <button id="reset">清空</button>
+  </div>
+  <div id="msg"></div>
+</div>
+<div class="card scroll">
+  <table>
+    <thead><tr><th>Id</th><th>应用</th><th>标题</th><th>跳转地址</th><th>排序</th><th>状态</th><th>展示</th><th>点击</th><th>操作</th></tr></thead>
+    <tbody id="rows"></tbody>
+  </table>
+</div>
+
+<!-- 页面地址是 /{管理入口}/plugin/static/ads/index.html,所以宿主脚本在 ../../sdk.js -->
+<script src="../../sdk.js"></script>
+<script>
+var 编辑Id = 0;
+function $(id) { return document.getElementById(id); }
+function 报错(e) { $('msg').textContent = e.message || String(e); }
+
+function 填表(项) {
+  编辑Id = 项.id || 0;
+  $('title').value = 项.title || ''; $('image').value = 项.image || ''; $('url').value = 项.url || '';
+  $('appId').value = 项.appId || 0; $('sort').value = 项.sort || 0; $('status').value = 项.status || 1;
+}
+
+function 加载() {
+  $('msg').textContent = '';
+  kyplugin.call('list').then(function (数据) {
+    var 表体 = $('rows');
+    表体.textContent = '';
+    数据.list.forEach(function (项) {
+      var 行 = document.createElement('tr');
+      // 用 textContent 输出,避免广告内容里的 HTML 被执行
+      [项.id, 项.appId || '全部', 项.title, 项.url, 项.sort, 项.status === 1 ? '投放' : '暂停', 项.showCount, 项.clickCount].forEach(function (值) {
+        var 格 = document.createElement('td'); 格.textContent = 值; 行.appendChild(格);
+      });
+      var 操作 = document.createElement('td');
+      var 改 = document.createElement('button'); 改.textContent = '编辑'; 改.onclick = function () { 填表(项); };
+      var 删 = document.createElement('button'); 删.textContent = '删除';
+      删.onclick = function () {
+        if (confirm('确定删除「' + 项.title + '」?')) kyplugin.call('delete', { id: 项.id }).then(加载).catch(报错);
+      };
+      操作.appendChild(改); 操作.appendChild(document.createTextNode(' ')); 操作.appendChild(删);
+      行.appendChild(操作);
+      表体.appendChild(行);
+    });
+  }).catch(报错);
+}
+
+$('save').onclick = function () {
+  kyplugin.call('save', {
+    id: 编辑Id, title: $('title').value.trim(), image: $('image').value.trim(), url: $('url').value.trim(),
+    appId: Number($('appId').value) || 0, sort: Number($('sort').value) || 0, status: Number($('status').value)
+  }).then(function () { 填表({}); 加载(); }).catch(报错);
+};
+$('reset').onclick = function () { 填表({}); };
+填表({});
+加载();
+</script>
+</body>
+</html>

@@ -1,0 +1,510 @@
+package controller
+
+import (
+	. "EFunc/utils"
+	"fmt"
+	"github.com/gin-gonic/gin"
+	"gorm.io/gorm"
+	"server/app/controller/Common"
+	"server/app/controller/Common/response"
+	"server/app/global"
+	"server/app/logic/common/captcha"
+	"server/app/logic/common/ka"
+	"server/app/logic/common/log"
+	"server/app/logic/common/realname"
+	"server/app/logic/common/setting"
+	"server/app/logic/common/user"
+	"server/app/models/constant"
+	"server/app/models/dbm"
+	"server/app/service"
+	utils2 "server/app/utils"
+	"strconv"
+	"strings"
+	"time"
+)
+
+type User struct {
+	Common.Common
+}
+
+func NewUserController() *User {
+	return &User{}
+}
+
+// 注册
+func (C *User) NewUserInfo(c *gin.Context) {
+	var 请求 struct {
+		User          string `json:"user" binding:"required,min=6,max=190" zh:"用户名"`    // 用户名
+		Password      string `json:"password" binding:"required,min=6,max=190" zh:"密码"` // 密码
+		QQ            string `json:"qq"`
+		Phone         string `json:"phone"`
+		SuperPassword string `json:"superPassword"   zh:"超级密码"` // 密码`
+		Email         string `json:"email"`
+		AppId         int    `json:"appId"`
+		Captcha       string `json:"captcha"`   // 验证码
+		CaptchaId     string `json:"captchaId"` // 验证码ID
+	}
+	//解析失败
+	if !C.ToJSON(c, &请求) {
+		return
+	}
+	var info = struct {
+		网页用户中心配置 dbm.DB_AppInfoWebUser
+		user     dbm.DB_User
+	}{}
+	var err error
+	tx := *global.GVA_DB
+
+	info.网页用户中心配置, err = service.NewAppInfoWebUser(c, &tx).Info(请求.AppId)
+	if err != nil || info.网页用户中心配置.Status != 1 {
+		response.FailWithMessage(c, constant.C常_关闭提示)
+		return
+	}
+
+	if info.网页用户中心配置.CaptchaReg == 1 {
+		//验证码验证码正确 = 真
+		if !captcha.VerifyClick(请求.CaptchaId, 请求.Captcha, true) {
+			response.FailWithMessage(c, "验证码错误")
+			return
+		}
+	}
+
+	info.user, err = user.L_user.New用户信息(c, 请求.User, 请求.Password, 请求.Password, 请求.QQ, 请求.Email, 请求.Phone, c.ClientIP(), "", 0, 0, 0, "")
+	if err != nil {
+		response.FailWithMessage(c, err.Error())
+		return
+	}
+
+	response.OkWithMessage(c, "注册成功")
+	return
+}
+
+// 密码找回或修改_密保手机
+func (C *User) GetPwSendSms(c *gin.Context) {
+	//{"appId":10001,"user":"aaaaaa","phoneCaptchaValue":"","phoneCaptchaId":"","newPassword":"ssssss","captchaId":"sC2rCHYoPgUVyXXjJW","captchaValue":"69|123,133|116,165|115,259|119"}
+	var 请求 struct {
+		AppId        int    `json:"appId" zh:"应用id"`
+		User         string `json:"user" binding:"required,min=6,max=190" zh:"用户名"`
+		CaptchaId    string `json:"captchaId" zh:"验证码id"`
+		CaptchaValue string `json:"captchaValue" zh:"验证码值"`
+	}
+	//解析失败
+	if !C.ToJSON(c, &请求) {
+		return
+	}
+	var info = struct {
+		网页用户中心配置 dbm.DB_AppInfoWebUser
+		user     dbm.DB_User
+	}{}
+	var err error
+	tx := *global.GVA_DB
+	info.网页用户中心配置, err = service.NewAppInfoWebUser(c, &tx).Info(请求.AppId)
+	if err != nil || info.网页用户中心配置.Status != 1 {
+		response.FailWithMessage(c, constant.C常_关闭提示)
+		return
+	}
+	//校验行为验证码,防止短信被刷,与SendSms接口一致,按应用配置开关校验,关闭时前端不弹验证码无需校验
+	if info.网页用户中心配置.CaptchaSendSms == 1 {
+		if !captcha.VerifyClick(请求.CaptchaId, 请求.CaptchaValue, true) {
+			response.FailWithMessage(c, "验证码错误")
+			return
+		}
+	}
+	info.user, err = service.NewUser(c, &tx).InfoName(请求.User)
+	if err != nil {
+		response.FailWithMessage(c, "用户不存在")
+		return
+	}
+	if info.user.UPAgentId > 0 {
+		response.FailWithMessage(c, "代理账号,不可操作")
+		return
+	}
+	局_msg := "绑定手机非正确手机号格式"
+	if !utils2.Z正则_校验手机号(info.user.Phone, &局_msg) {
+		response.FailWithMessage(c, 局_msg)
+		return
+	}
+
+	//频率限制:同一IP一小时内最多发送10次
+	局_IP计数键 := "GetPwSendSms_IP_" + c.ClientIP()
+	if 局_缓存值, ok := global.H缓存.Get(局_IP计数键); ok && interfaceToInt(局_缓存值) >= 10 {
+		go log.L_log.S写风控日志(c, 0, log.Log风控类型_Api异常调用, 请求.User, c.ClientIP(), "使用绑定手机密码找回,IP发送短信过于频繁")
+		response.FailWithMessage(c, "发送过于频繁,请稍后再试")
+		return
+	}
+	//频率限制:同一用户60秒内只能发送一次(Add原子操作,防止并发绕过)
+	if err = global.H缓存.Add("GetPwSendSms_"+请求.User, 1, time.Minute); err != nil {
+		response.FailWithMessage(c, "发送过于频繁,请稍后再试")
+		return
+	}
+
+	局_验证码 := W文本_取随机字符串_数字(6)
+	局_验证码ID := "Note" + utils2.Md5String(info.user.Phone)[:16] + W文本_取随机字符串(15)
+	err = captcha.SendSMS([]string{局_验证码}, info.user.Phone)
+	if err != nil {
+		log.L_log.Log_写用户消息(log.Log用户消息类型_系统执行错误, constant.APPID_Web用户中心, 请求.User, strconv.Itoa(constant.APPID_Web用户中心), "", fmt.Sprintf("短信验证码发送失败:%v,%v,%v", 局_验证码, info.user.Phone, err.Error()), c.ClientIP())
+		response.FailWithMessage(c, "发送失败")
+		return
+	}
+	//发送成功,IP计数+1
+	if _, ok := global.H缓存.Get(局_IP计数键); ok {
+		_ = global.H缓存.Increment(局_IP计数键, 1)
+	} else {
+		global.H缓存.Set(局_IP计数键, 1, time.Hour)
+	}
+	captcha.VerificationCodes.Set(局_验证码ID, 局_验证码)
+	response.OkWithData(c, gin.H{"captchaType": 3, "captchaId": 局_验证码ID})
+	return
+}
+func (C *User) GetInfo(c *gin.Context) {
+	var info = struct {
+		user     dbm.DB_User
+		appInfo  dbm.DB_AppInfo
+		likeInfo dbm.DB_LinksToken
+	}{}
+	var err error
+	Y用户数据信息还原(c, &info.likeInfo, &info.appInfo)
+	tx := *global.GVA_DB
+	info.user, err = service.NewUser(c, &tx).Info(info.likeInfo.Uid)
+	if err != nil {
+		response.FailWithMessage(c, "用户不存在")
+		return
+	}
+	if info.user.UPAgentId > 0 {
+		response.FailWithMessage(c, "代理账号,不可操作")
+		return
+	}
+
+	//实名功能总开关(系统设置-实名接口配置) + 应用级开关(应用编辑-网页用户中心-实名认证)同时开启才可用
+	局_网页用户中心配置, 局_网页配置err := service.NewAppInfoWebUser(c, &tx).Info(info.appInfo.AppId)
+	//实名奖励卡类名称,有值时用户中心未实名入口显示"奖"徽章
+	局_实名奖励卡名 := ""
+	if 局_网页配置err == nil && 局_网页用户中心配置.RealNameStatus != constant.S实名状态_不启用 && 局_网页用户中心配置.RealNameGiftKaClassId > 0 {
+		局_实名奖励卡名 = S实名_取奖励卡名(c, &tx, 局_网页用户中心配置.RealNameGiftKaClassId)
+	}
+	response.OkWithData(c, gin.H{
+		"user":                info.user.User,
+		"phone":               info.user.Phone,
+		"qq":                  info.user.Qq,
+		"email":               info.user.Email,
+		"upAgentId":           info.user.UPAgentId,
+		"realNameAttestation": info.user.RealNameAttestation,
+		"realNameEnabled":     setting.Q实名认证配置().D当前选择 != realname.S实名平台_未开启 && 局_网页配置err == nil && 局_网页用户中心配置.RealNameStatus != constant.S实名状态_不启用,
+		"realNameGiftKaName":  局_实名奖励卡名,
+		"loginIp":             info.user.LoginIp,
+		"loginTime":           info.user.LoginTime,
+		"registerIp":          info.user.RegisterIp,
+		"registerTime":        info.user.RegisterTime,
+	})
+
+	return
+}
+
+// RealNameAttestation 用户实名认证,核验通过把"姓名|平台唯一标识"写入用户表,身份证号不落库
+func (C *User) RealNameAttestation(c *gin.Context) {
+	var 请求 struct {
+		Name   string `json:"name" binding:"required,max=20" zh:"姓名"`
+		IdCard string `json:"idCard" binding:"required,max=18" zh:"身份证号"`
+	}
+	//解析失败
+	if !C.ToJSON(c, &请求) {
+		return
+	}
+	var info = struct {
+		appInfo  dbm.DB_AppInfo
+		likeInfo dbm.DB_LinksToken
+	}{}
+	Y用户数据信息还原(c, &info.likeInfo, &info.appInfo)
+	if !Y限账号模式应用(c, &info.appInfo) {
+		return
+	}
+
+	tx := *global.GVA_DB
+	局_网页用户中心配置, err := service.NewAppInfoWebUser(c, &tx).Info(info.appInfo.AppId)
+	if err != nil || 局_网页用户中心配置.RealNameStatus == constant.S实名状态_不启用 {
+		response.FailWithMessage(c, "应用未启用实名")
+		return
+	}
+
+	//频率限制:同一用户60秒内只能认证一次,防止反复调用消耗平台核验费用
+	if err = global.H缓存.Add(fmt.Sprintf("RealNameAttestation_%d", info.likeInfo.Uid), 1, time.Minute); err != nil {
+		response.FailWithMessage(c, "操作过于频繁,请一分钟后再试")
+		return
+	}
+
+	局_userService := service.NewUser(c, &tx)
+	局_user, err := 局_userService.Info(info.likeInfo.Uid)
+	if err != nil {
+		response.FailWithMessage(c, "用户不存在")
+		return
+	}
+	if 局_user.UPAgentId > 0 {
+		response.FailWithMessage(c, "代理账号,不可操作")
+		return
+	}
+	if 局_user.RealNameAttestation != "" {
+		response.FailWithMessage(c, "您已完成实名认证,无需重复认证")
+		return
+	}
+
+	局_唯一Id, err := realname.S实名_认证(请求.Name, 请求.IdCard)
+	if err != nil {
+		response.FailWithMessage(c, err.Error())
+		return
+	}
+	if _, err = 局_userService.Update(局_user.Id, map[string]interface{}{"RealNameAttestation": strings.TrimSpace(请求.Name) + "|" + 局_唯一Id}); err != nil {
+		response.FailWithMessage(c, "实名信息保存失败:"+err.Error())
+		return
+	}
+
+	//实名奖励:参考归属代理送卡,按应用配置的卡类直充,先落实名状态再发奖励,奖励失败不影响实名成功
+	局_提示 := "实名认证成功"
+	局_奖励卡名 := ""
+	if 局_网页用户中心配置.RealNameGiftKaClassId > 0 {
+		局_奖励卡名 = S实名_取奖励卡名(c, &tx, 局_网页用户中心配置.RealNameGiftKaClassId)
+		if 局_奖励err := S实名_发奖励(c, 局_网页用户中心配置.RealNameGiftKaClassId, 局_user.Id); 局_奖励err != nil {
+			//发放失败不返回卡名,前端只做普通成功提示
+			局_奖励卡名 = ""
+			go log.L_log.Log_写用户消息(log.Log用户消息类型_系统执行错误, constant.APPID_Web用户中心, 局_user.User, strconv.Itoa(constant.APPID_Web用户中心), "", fmt.Sprintf("实名认证成功但实名奖励发放失败,卡类id:%d,Uid:%d,%v", 局_网页用户中心配置.RealNameGiftKaClassId, 局_user.Id, 局_奖励err), c.ClientIP())
+			局_提示 = "实名认证成功,实名奖励发放失败,请联系管理员处理"
+		} else {
+			局_提示 = "实名认证成功,实名奖励已到账"
+		}
+	}
+	response.OkWithDetailed(c, gin.H{"giftKaName": 局_奖励卡名}, 局_提示)
+	return
+}
+
+// S实名_取奖励卡名 查询实名奖励卡类名称,卡类不存在返回空
+func S实名_取奖励卡名(c *gin.Context, tx *gorm.DB, 卡类id int) string {
+	局_卡类, err := service.NewKaClass(c, tx).Info(卡类id)
+	if err != nil {
+		return ""
+	}
+	return 局_卡类.Name
+}
+
+// S实名_发奖励 实名奖励发放,调用卡类直充事务并落充值日志,参考cps发放被邀奖励卡实现
+func S实名_发奖励(c *gin.Context, 卡类id int, Uid int) (err error) {
+	if err = ka.L_ka.K卡类直冲_事务(c, 卡类id, Uid); err != nil {
+		return err
+	}
+	var 局_日志余额 []dbm.DB_LogMoney
+	var 局_日志积分 []dbm.DB_LogVipNumber
+	if 局_临时数据, ok := c.Get("logMoney"); ok {
+		局_日志余额 = append(局_日志余额, 局_临时数据.(dbm.DB_LogMoney))
+		局_日志余额[len(局_日志余额)-1].Note = "实名奖励,卡类id:" + strconv.Itoa(卡类id) + 局_日志余额[len(局_日志余额)-1].Note
+		delete(c.Keys, "logMoney")
+	}
+	if 局_临时数据, ok := c.Get("logVipNumber"); ok {
+		局_日志积分 = append(局_日志积分, 局_临时数据.(dbm.DB_LogVipNumber))
+		局_日志积分[len(局_日志积分)-1].Note = "实名奖励,卡类id:" + strconv.Itoa(卡类id) + 局_日志积分[len(局_日志积分)-1].Note
+		delete(c.Keys, "logVipNumber")
+	}
+	if err = log.L_log.S输出日志(c, 局_日志余额); err != nil {
+		global.GVA_LOG.Println("输出日志失败!", err)
+	}
+	if err = log.L_log.S输出日志(c, 局_日志积分); err != nil {
+		global.GVA_LOG.Println("输出日志失败!", err)
+	}
+	return nil
+}
+
+func (C *User) SmsCodeSetPassWord(c *gin.Context) {
+	var 请求 struct {
+		User              string `json:"user" binding:"required,min=6,max=190" zh:"用户名"`
+		NewPassWord       string `json:"newPassword" binding:"required,min=6,max=18" zh:"密码"`
+		PhoneCaptchaId    string `json:"phoneCaptchaId" binding:"required,min=6,max=180" zh:"验证码ID"`
+		PhoneCaptchaValue string `json:"phoneCaptchaValue" binding:"required,min=6,max=18" zh:"验证码"`
+	}
+	//解析失败
+	if !C.ToJSON(c, &请求) {
+		return
+	}
+	var info = struct {
+		user dbm.DB_User
+	}{}
+	var err error
+
+	局_临时文本 := ""
+	if !utils2.Z正则_校验密码(请求.NewPassWord, &局_临时文本) {
+		response.FailWithMessage(c, 局_临时文本)
+		return
+	}
+	tx := *global.GVA_DB
+	info.user, err = service.NewUser(c, &tx).InfoName(请求.User)
+	if err != nil {
+		response.FailWithMessage(c, "用户不存在")
+		return
+	}
+
+	if strings.Index(请求.PhoneCaptchaId, "Note") != 0 {
+		go log.L_log.S写风控日志(c, 0, log.Log风控类型_Api异常调用, 请求.User, c.ClientIP(), "使用绑定手机密码找回或修改,用户使用非短信验证码Id进行提交,可能是异常用户")
+		response.FailWithMessage(c, "验证码错误.")
+		return
+	}
+
+	if info.user.Phone == "" || strings.Index(请求.PhoneCaptchaId, "Note"+utils2.Md5String(info.user.Phone)[:16]) == -1 {
+		go log.L_log.S写风控日志(c, 0, log.Log风控类型_Api异常调用, info.user.User, c.ClientIP(), "使用绑定手机密码找回或修改,用户使用非账号绑定的验证码进行提交,可能是异常用户")
+		response.FailWithMessage(c, "验证码错误.")
+		return
+	}
+	//防暴力破解:失败次数达到上限后锁定10分钟
+	局_失败计数键 := "SmsPwErr_" + 请求.User
+	if 局_缓存值, ok := global.H缓存.Get(局_失败计数键); ok && interfaceToInt(局_缓存值) >= 5 {
+		go log.L_log.S写风控日志(c, 0, log.Log风控类型_Api异常调用, 请求.User, c.ClientIP(), "使用绑定手机密码找回或修改,短信验证码错误次数过多,疑似暴力破解")
+		response.FailWithMessage(c, "错误次数过多,请重新获取验证码")
+		return
+	}
+	if !captcha.VerificationCodes.Verify(请求.PhoneCaptchaId, 请求.PhoneCaptchaValue, false) {
+		//记录失败次数
+		if _, ok := global.H缓存.Get(局_失败计数键); ok {
+			_ = global.H缓存.Increment(局_失败计数键, 1)
+		} else {
+			global.H缓存.Set(局_失败计数键, 1, time.Minute*10)
+		}
+		response.FailWithMessage(c, "短信验证码错误.")
+		return
+	}
+	//验证成功,清除失败计数
+	global.H缓存.Delete(局_失败计数键)
+
+	_, err = service.NewUser(c, &tx).Update(info.user.Id, map[string]interface{}{"PassWord": utils2.Md5String(请求.NewPassWord)})
+	if err != nil {
+		response.FailWithMessage(c, "修改失败")
+	} else {
+		_ = service.NewLinksToken(c, &tx).Set批量注销Uid(info.user.Id, constant.Z注销_用户改密注销)
+		response.OkWithMessage(c, "修改成功")
+	}
+	return
+}
+
+func (C *User) Logout(c *gin.Context) {
+	var err error
+	var info = struct {
+		appInfo  dbm.DB_AppInfo
+		likeInfo dbm.DB_LinksToken
+	}{}
+	Y用户数据信息还原(c, &info.likeInfo, &info.appInfo)
+
+	db := *global.GVA_DB
+	err = service.NewLinksToken(c, &db).Set批量注销([]int{info.likeInfo.Id}, constant.Z注销_用户操作注销)
+	if err != nil {
+		response.FailWithMessage(c, "注销失败")
+		return
+	}
+	response.OkWithMessage(c, "注销成功")
+	return
+}
+func (C *User) SetBaseInfo(c *gin.Context) {
+	var 请求 struct {
+		Type         string `json:"type" binding:"required" zh:"类型"`
+		Value        string `json:"value" binding:"required" zh:"值"`
+		CaptchaId    string `json:"captchaId" binding:"" zh:"验证码id"`
+		CaptchaValue string `json:"captchaValue" binding:"" zh:"验证码值"`
+	}
+	//解析失败
+	if !C.ToJSON(c, &请求) {
+		return
+	}
+	var err error
+	var info = struct {
+		appInfo  dbm.DB_AppInfo
+		likeInfo dbm.DB_LinksToken
+	}{}
+	Y用户数据信息还原(c, &info.likeInfo, &info.appInfo)
+	if !Y限账号模式应用(c, &info.appInfo) {
+		return
+	}
+	tx := *global.GVA_DB
+	switch 请求.Type {
+	case "email":
+		_, err = service.NewUser(c, &tx).Update(info.likeInfo.Uid, map[string]interface{}{"Email": 请求.Value})
+	case "qq":
+		_, err = service.NewUser(c, &tx).Update(info.likeInfo.Uid, map[string]interface{}{"Qq": 请求.Value})
+	case "phone":
+		//校验验证码是否正确,
+
+		if !captcha.VerificationCodes.Verify(请求.CaptchaId, 请求.CaptchaValue, false) {
+			response.FailWithMessage(c, "短信验证码错误.")
+			return
+		}
+		if 请求.Value == "" || strings.Index(请求.CaptchaId, "Note"+utils2.Md5String(请求.Value)[:16]) == -1 {
+			go log.L_log.S写风控日志(c, info.likeInfo.Id, log.Log风控类型_Api异常调用, info.likeInfo.User, c.ClientIP(), "用户使用非新手机号绑定的验证码进行提交,更换绑定手机,可能是异常用户")
+			response.FailWithMessage(c, "验证码错误.")
+			return
+		}
+		_, err = service.NewUser(c, &tx).Update(info.likeInfo.Uid, map[string]interface{}{"Phone": 请求.Value})
+
+	default:
+		response.FailWithMessage(c, "不支持的操作类型")
+		return
+	}
+	if err != nil {
+		response.FailWithMessage(c, err.Error())
+		return
+	}
+
+	response.OkWithMessage(c, "保存成功")
+	return
+}
+
+func (C *User) SendSms(c *gin.Context) {
+	var 请求 struct {
+		Phone     string `json:"phone" binding:"required,len=11" zh:"手机号"`
+		Captcha   string `json:"captcha"`   // 验证码
+		CaptchaId string `json:"captchaId"` // 验证码ID
+	}
+	//解析失败
+	if !C.ToJSON(c, &请求) {
+		return
+	}
+	var err error
+	var info = struct {
+		appInfo  dbm.DB_AppInfo
+		likeInfo dbm.DB_LinksToken
+		网页用户中心配置 dbm.DB_AppInfoWebUser
+	}{}
+	Y用户数据信息还原(c, &info.likeInfo, &info.appInfo)
+	if !Y限账号模式应用(c, &info.appInfo) {
+		return
+	}
+
+	tx := *global.GVA_DB
+
+	info.网页用户中心配置, err = service.NewAppInfoWebUser(c, &tx).Info(info.appInfo.AppId)
+	if err != nil || info.网页用户中心配置.Status != 1 {
+		response.FailWithMessage(c, constant.C常_关闭提示)
+		return
+	}
+
+	if info.网页用户中心配置.CaptchaSendSms == 1 {
+		//验证码验证码正确 = 真
+		if !captcha.VerifyClick(请求.CaptchaId, 请求.Captcha, true) {
+			response.FailWithMessage(c, "验证码错误")
+			return
+		}
+	}
+
+	局_msg := "手机号码非正确手机号格式"
+	if !utils2.Z正则_校验手机号(请求.Phone, &局_msg) {
+		response.FailWithMessage(c, 局_msg)
+		return
+	}
+	//频率限制:同一手机号60秒内只能发送一次(Add原子操作,防止并发绕过)
+	if err = global.H缓存.Add("SendSms_"+请求.Phone, 1, time.Minute); err != nil {
+		response.FailWithMessage(c, "发送过于频繁,请稍后再试")
+		return
+	}
+	局_验证码 := W文本_取随机字符串_数字(6)
+	局_验证码ID := "Note" + utils2.Md5String(请求.Phone)[:16] + W文本_取随机字符串(15)
+	err = captcha.SendSMS([]string{局_验证码}, 请求.Phone)
+	if err != nil {
+		log.L_log.Log_写用户消息(log.Log用户消息类型_系统执行错误, constant.APPID_Web用户中心, info.likeInfo.User, strconv.Itoa(constant.APPID_Web用户中心), "", fmt.Sprintf("短信验证码发送失败:%v,%v,%v", 局_验证码, 请求.Phone, err.Error()), c.ClientIP())
+		response.FailWithMessage(c, "发送失败")
+		return
+	}
+	captcha.VerificationCodes.Set(局_验证码ID, 局_验证码)
+	response.OkWithData(c, gin.H{"captchaType": 3, "captchaId": 局_验证码ID})
+	return
+}

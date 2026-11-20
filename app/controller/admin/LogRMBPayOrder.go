@@ -1,0 +1,340 @@
+package controller
+
+import (
+	"encoding/json"
+	"fmt"
+	"github.com/gin-gonic/gin"
+	"server/app/controller/Common"
+	"server/app/global"
+	"server/app/logic/common/log"
+	"server/app/logic/common/rmbPay"
+	"server/app/logic/common/user"
+	"server/app/models/common"
+	"server/app/models/constant"
+	"server/app/models/dbm"
+	"server/app/models/old/response"
+	"server/app/service"
+	"strconv"
+	"strings"
+	"time"
+)
+
+type LogRMBPayOrderCtrl struct {
+	Common.Common
+}
+
+func NewLogRMBPayOrderController() *LogRMBPayOrderCtrl {
+	return &LogRMBPayOrderCtrl{}
+}
+
+type 请求_LogRMBPayOrderGetInfo struct {
+	Id int `json:"id"`
+}
+
+type 请求_LogRMBPayOrderGetList struct {
+	Page         int      `json:"page"`
+	Size         int      `json:"size"`
+	Type         int      `json:"type"`
+	Status       int      `json:"status"`
+	AppId        int      `json:"appId"`
+	Keywords     string   `json:"keywords"`
+	Order        int      `json:"order"`
+	RegisterTime []string `json:"registerTime"`
+	Count        int64    `json:"count"`
+}
+
+type 请求_LogRMBPayOrderDelete struct {
+	Id       []int  `json:"id"`
+	Type     int    `json:"type"`
+	Keywords string `json:"keywords"`
+}
+
+type 请求_LogRMBPayOrderOut struct {
+	PayOrder string `json:"payOrder"`
+	IsOutRMB bool   `json:"isOutRMB"`
+	Note     string `json:"note"`
+}
+
+type 请求_LogRMBPayOrderMakeUp struct {
+	PayOrder string `json:"payOrder"`
+	Note     string `json:"note"`
+}
+
+type 请求_LogRMBPayOrderSetNote struct {
+	PayOrder []string `json:"payOrder"`
+	Note     string   `json:"note"`
+}
+
+type 响应_LogRMBPayOrderGetList struct {
+	List  []响应_LogRMBPayOrderGetListItem `json:"list"`
+	Count int64                          `json:"count"`
+}
+
+type 响应_LogRMBPayOrderGetListItem struct {
+	dbm.DB_LogRMBPayOrder
+	Processing string `json:"processing"`
+}
+
+// Info 获取余额充值订单详情
+func (C *LogRMBPayOrderCtrl) Info(c *gin.Context) {
+	var 请求 请求_LogRMBPayOrderGetInfo
+	if !C.ToJSON(c, &请求) {
+		return
+	}
+
+	var DB_LogRMBPayOrder dbm.DB_LogRMBPayOrder
+	db := *global.GVA_DB
+	err := db.Model(dbm.DB_LogRMBPayOrder{}).Where("Id= ?", 请求.Id).First(&DB_LogRMBPayOrder).Error
+	if err != nil {
+		response.FailWithMessage("获取失败,可能不存在", c)
+		return
+	}
+	response.OkWithDetailed(DB_LogRMBPayOrder, "获取成功", c)
+}
+
+// GetList 获取余额充值订单列表
+func (C *LogRMBPayOrderCtrl) GetList(c *gin.Context) {
+	var 请求 请求_LogRMBPayOrderGetList
+	if !C.ToJSON(c, &请求) {
+		return
+	}
+	db := *global.GVA_DB
+	局_DB := db.Model(dbm.DB_LogRMBPayOrder{})
+	if 请求.Order == 1 {
+		局_DB = 局_DB.Order("db_Log_RMBPayOrder.Id ASC")
+	} else {
+		局_DB = 局_DB.Order("db_Log_RMBPayOrder.Id DESC")
+	}
+	if 请求.RegisterTime != nil && len(请求.RegisterTime) == 2 && 请求.RegisterTime[0] != "" && 请求.RegisterTime[1] != "" {
+		制卡开始时间, _ := strconv.ParseInt(请求.RegisterTime[0], 10, 64)
+		制卡结束时间, _ := strconv.ParseInt(请求.RegisterTime[1], 10, 64)
+		局_DB = 局_DB.Where("db_Log_RMBPayOrder.Time > ?", 制卡开始时间).Where("db_Log_RMBPayOrder.Time < ?", 制卡结束时间+86400)
+	}
+	if 请求.Keywords != "" {
+		switch 请求.Type {
+		case 1:
+			局_DB = 局_DB.Where("LOCATE( ?, db_Log_RMBPayOrder.User)>0 ", 请求.Keywords)
+		case 2:
+			局_DB = 局_DB.Where("LOCATE( ?, db_Log_RMBPayOrder.Note)>0 ", 请求.Keywords)
+		case 3:
+			局_DB = 局_DB.Where("db_Log_RMBPayOrder.Ip = ? ", 请求.Keywords)
+		case 4:
+			局_DB = 局_DB.Where("LOCATE( ?, db_Log_RMBPayOrder.PayOrder)>0 ", 请求.Keywords)
+		case 5:
+			局_DB = 局_DB.Where("LOCATE( ?, db_Log_RMBPayOrder.PayOrder2)>0 ", 请求.Keywords)
+		case 6:
+			局_DB = 局_DB.Where("db_Log_RMBPayOrder.Rmb = ? ", 请求.Keywords)
+		}
+	}
+	if 请求.Status > 0 {
+		局_DB = 局_DB.Where("db_Log_RMBPayOrder.Status  = ? ", 请求.Status)
+	}
+	if 请求.AppId > 0 {
+		局_DB = 局_DB.Where("db_Log_RMBPayOrder.AppId = ? ", 请求.AppId)
+	}
+
+	var DB_LogRMBPayOrder []dbm.DB_LogRMBPayOrder
+	var 总数 int64
+	if 请求.Count > 500000 {
+		总数 = 请求.Count
+	} else {
+		局_DB.Count(&总数)
+	}
+	局_DB = 局_DB.Select("db_Log_RMBPayOrder.*")
+	err := 局_DB.Limit(请求.Size).Offset((请求.Page - 1) * 请求.Size).Find(&DB_LogRMBPayOrder).Error
+	if err != nil {
+		response.FailWithMessage("查询失败,参数异常"+err.Error(), c)
+		return
+	}
+
+	var 局_响应 []响应_LogRMBPayOrderGetListItem
+	局_响应 = make([]响应_LogRMBPayOrderGetListItem, len(DB_LogRMBPayOrder))
+	for 索引 := range DB_LogRMBPayOrder {
+		局_响应[索引].DB_LogRMBPayOrder = DB_LogRMBPayOrder[索引]
+		局_响应[索引].Processing = service.C处理类型[DB_LogRMBPayOrder[索引].ProcessingType]
+		if 局_响应[索引].Processing == "" {
+			局_响应[索引].Processing = "未知原因" + strconv.Itoa(DB_LogRMBPayOrder[索引].ProcessingType)
+		}
+		var tmp interface{}
+		if err = json.Unmarshal([]byte(局_响应[索引].Extra), &tmp); err == nil {
+			if formatted, err2 := json.MarshalIndent(tmp, "", "    "); err2 == nil {
+				局_响应[索引].Extra = string(formatted)
+			}
+		}
+		局_响应[索引].Extra = "<pre>" + strings.ReplaceAll(局_响应[索引].Extra, "\n", "<br />") + "<pre />"
+	}
+	response.OkWithDetailed(响应_LogRMBPayOrderGetList{局_响应, 总数}, "获取成功", c)
+}
+
+// Delete 批量删除余额充值订单
+func (C *LogRMBPayOrderCtrl) Delete(c *gin.Context) {
+	var 请求 请求_LogRMBPayOrderDelete
+	if !C.ToJSON(c, &请求) {
+		return
+	}
+	var 影响行数 int64
+	db := *global.GVA_DB
+	db.Model(dbm.DB_LogRMBPayOrder{})
+
+	switch 请求.Type {
+	default:
+		response.FailWithMessage("Type错误", c)
+		return
+	case 1:
+		if len(请求.Id) == 0 {
+			response.FailWithMessage("Id数组没有要删除的ID", c)
+			return
+		}
+		影响行数 = db.Where("Id IN ? ", 请求.Id).Delete(dbm.DB_LogRMBPayOrder{}).RowsAffected
+	case 2:
+		影响行数 = db.Where("User = ? ", 请求.Keywords).Delete(dbm.DB_LogRMBPayOrder{}).RowsAffected
+	case 3:
+		影响行数 = db.Where("1=1").Delete(dbm.DB_LogRMBPayOrder{}).RowsAffected
+	case 4:
+		影响行数 = db.Where("Time <  ?", time.Now().Unix()-604800).Delete(dbm.DB_LogRMBPayOrder{}).RowsAffected
+	case 5:
+		影响行数 = db.Where("Time <  ?", time.Now().Unix()-2592000).Delete(dbm.DB_LogRMBPayOrder{}).RowsAffected
+	case 6:
+		影响行数 = db.Where("Time <  ?", time.Now().Unix()-7776000).Delete(dbm.DB_LogRMBPayOrder{}).RowsAffected
+	case 7:
+		if len(请求.Keywords) == 0 {
+			response.FailWithMessage("关键字不能为空", c)
+			return
+		}
+		影响行数 = db.Where("LOCATE( ?, Note)>0 ", 请求.Keywords).Delete(dbm.DB_LogRMBPayOrder{}).RowsAffected
+	case 8:
+		状态id := []int{
+			constant.D订单状态_等待支付,
+			constant.D订单状态_已关闭,
+		}
+		影响行数 = db.Where("Time <  ?", time.Now().Unix()-3600).Where("Status IN ?", 状态id).Delete(dbm.DB_LogRMBPayOrder{}).RowsAffected
+		if db.Error == nil {
+			response.OkWithMessage("删除过期(1小时前)待支付和已关闭成功,数量"+strconv.FormatInt(影响行数, 10), c)
+			return
+		}
+	}
+	if db.Error != nil {
+		response.FailWithMessage("删除失败", c)
+		return
+	}
+	response.OkWithMessage("删除成功,数量"+strconv.FormatInt(影响行数, 10), c)
+}
+
+// Out 退款
+func (C *LogRMBPayOrderCtrl) Out(c *gin.Context) {
+	var 请求 请求_LogRMBPayOrderOut
+	if !C.ToJSON(c, &请求) {
+		return
+	}
+	var 参数 common.PayParams
+	参数.PayOrder = 请求.PayOrder
+	err := rmbPay.L_rmbPay.D订单退款(c, 参数, 请求.IsOutRMB, 请求.Note)
+	if err != nil {
+		response.FailWithMessage(err.Error(), c)
+		return
+	}
+	response.OkWithMessage("操作成功", c)
+}
+
+// SetNote 批量修改备注
+func (C *LogRMBPayOrderCtrl) SetNote(c *gin.Context) {
+	var 请求 请求_LogRMBPayOrderSetNote
+	if !C.ToJSON(c, &请求) {
+		return
+	}
+	if len(请求.PayOrder) == 0 {
+		response.FailWithMessage("订单数组为空", c)
+		return
+	}
+	db := *global.GVA_DB
+	err := service.NewRmbPayService(&db).Order更新订单备注_批量(请求.PayOrder, 请求.Note)
+	if err != nil {
+		response.FailWithMessage("修改失败", c)
+		global.GVA_LOG.Println("修改失败:" + err.Error())
+		return
+	}
+	response.OkWithMessage("修改成功", c)
+}
+
+// MakeUp 手动补单 - 对未支付订单进行手动补单,执行充值并修改状态为成功
+func (C *LogRMBPayOrderCtrl) MakeUp(c *gin.Context) {
+	var 请求 请求_LogRMBPayOrderMakeUp
+	if !C.ToJSON(c, &请求) {
+		return
+	}
+	if 请求.PayOrder == "" {
+		response.FailWithMessage("订单号不能为空", c)
+		return
+	}
+
+	// 查询订单
+	var 订单 dbm.DB_LogRMBPayOrder
+	db := *global.GVA_DB
+	err := db.Model(dbm.DB_LogRMBPayOrder{}).Where("PayOrder = ?", 请求.PayOrder).First(&订单).Error
+	if err != nil {
+		response.FailWithMessage("订单不存在", c)
+		return
+	}
+
+	// 等待支付(1)或已关闭(7)的订单可以补单
+	if 订单.Status != constant.D订单状态_等待支付 && 订单.Status != constant.D订单状态_已关闭 {
+		response.FailWithMessage("只有等待支付或已关闭的订单才能手动补单", c)
+		return
+	}
+
+	// 根据处理类型执行充值
+	switch 订单.ProcessingType {
+	case constant.D订单类型_余额充值:
+		// 余额充值: 直接增加用户余额
+		var 新余额 float64
+		if 新余额, err = user.L_user.Id余额增减(c, 订单.Uid, 订单.Rmb, true); err != nil {
+			response.FailWithMessage("充值用户余额失败:"+err.Error(), c)
+			return
+		}
+		备注 := "管理员手动补单,订单:" + 订单.PayOrder + "|新余额≈" + fmt.Sprintf("%.2f", 新余额)
+		if 请求.Note != "" {
+			备注 = 请求.Note + "|" + 备注
+		}
+		log.L_log.Log_写余额日志(订单.User, c.ClientIP(), 备注, 订单.Rmb)
+		global.GVA_DB.Model(dbm.DB_LogRMBPayOrder{}).Where("Id = ?", 订单.Id).Update("Status", constant.D订单状态_成功)
+
+	case constant.D订单类型_购卡直冲:
+		// 购卡直冲: 调用支付成功后处理逻辑
+		var 参数 common.PayParams
+		参数.DB_LogRMBPayOrder = 订单
+		参数.Status = constant.D订单状态_已付待处理
+		// 先将状态改为已付待处理
+		global.GVA_DB.Model(dbm.DB_LogRMBPayOrder{}).Where("Id = ?", 订单.Id).Update("Status", constant.D订单状态_已付待处理)
+		if err = rmbPay.L_rmbPay.Z支付成功_后处理(c, &参数); err != nil {
+			// 后处理失败,恢复为等待支付状态
+			global.GVA_DB.Model(dbm.DB_LogRMBPayOrder{}).Where("Id = ?", 订单.Id).Update("Status", constant.D订单状态_等待支付)
+			response.FailWithMessage("购卡直冲补单失败:"+err.Error(), c)
+			return
+		}
+
+	case constant.D订单类型_支付购卡:
+		// 支付购卡: 调用支付成功后处理逻辑
+		var 参数 common.PayParams
+		参数.DB_LogRMBPayOrder = 订单
+		参数.Status = constant.D订单状态_已付待处理
+		// 先将状态改为已付待处理
+		global.GVA_DB.Model(dbm.DB_LogRMBPayOrder{}).Where("Id = ?", 订单.Id).Update("Status", constant.D订单状态_已付待处理)
+		if err = rmbPay.L_rmbPay.Z支付成功_后处理(c, &参数); err != nil {
+			// 后处理失败,恢复为等待支付状态
+			global.GVA_DB.Model(dbm.DB_LogRMBPayOrder{}).Where("Id = ?", 订单.Id).Update("Status", constant.D订单状态_等待支付)
+			response.FailWithMessage("支付购卡补单失败:"+err.Error(), c)
+			return
+		}
+
+	default:
+		response.FailWithMessage("未知的订单处理类型:"+strconv.Itoa(订单.ProcessingType), c)
+		return
+	}
+
+	// 补单成功后更新备注
+	if 请求.Note != "" {
+		global.GVA_DB.Model(dbm.DB_LogRMBPayOrder{}).Where("Id = ?", 订单.Id).Update("Note", 请求.Note)
+	}
+
+	response.OkWithMessage("手动补单成功", c)
+}

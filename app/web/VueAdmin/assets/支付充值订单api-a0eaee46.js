@@ -1,0 +1,1 @@
+import{s as t}from"./request-d36b4021.js";import{取 as o}from"./index-f39faf71.js";const s=o()+"/logRMBPayOrder/",a=o=>t({url:s+"getList",method:"post",data:o}),e=o=>t({url:s+"delete",method:"post",data:o}),r=o=>t({url:s+"out",method:"post",data:o}),d=o=>t({url:s+"setPayOrderNote",method:"post",data:o});export{e as D,a as G,r as O,d as S};

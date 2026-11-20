@@ -1,0 +1,1015 @@
+package controller
+
+import (
+	"EFunc/utils"
+	"fmt"
+	"github.com/gin-gonic/gin"
+	"github.com/google/uuid"
+	"gorm.io/gorm"
+	"server/app/controller/Common"
+	"server/app/global"
+	"server/app/logic/common/agent"
+	"server/app/logic/common/agentLevel"
+	"server/app/logic/common/appUser"
+	"server/app/logic/common/log"
+	"server/app/models/constant"
+	"server/app/models/dbm"
+	"server/app/models/old/response"
+	"server/app/service"
+	"strconv"
+	"strings"
+	"time"
+)
+
+type AppUserFull struct {
+	Common.Common
+}
+
+const 集_缓存key前缀_批量维护全部用户 = "appUser_batch_update_all_"
+
+func NewAppUserFullController() *AppUserFull {
+	return &AppUserFull{}
+}
+
+// 文本_转义Like 转义SQL LIKE通配符(\ % _),避免用户名中的下划线被当作单字符通配符导致误匹配
+func 文本_转义Like(值 string) string {
+	局_替换器 := strings.NewReplacer("\\", "\\\\", "%", "\\%", "_", "\\_")
+	return 局_替换器.Replace(值)
+}
+
+type 结构_批量维护全部用户缓存 struct {
+	AppId   int
+	AdminId int
+	Id数组    []int
+	Uid数组   []int
+	已执行     bool
+	创建时间    int64
+}
+
+func 批量维护全部用户_取缓存key(任务Id string) string {
+	return 集_缓存key前缀_批量维护全部用户 + 任务Id
+}
+
+type DB_AppUser带User信息 struct {
+	dbm.DB_AppUser
+	User       string `json:"user" gorm:"column:User;index;comment:用户登录名"`
+	Name       string `json:"name" gorm:"column:Name;index;comment:卡号"`
+	Status     int    `json:"status" gorm:"column:Status;default:1;comment:用户是状态 1正常 2冻结"`
+	LinksCount int    `json:"linksCount" gorm:"column:LinksCount;index;comment:在线总数"`
+}
+
+// Info 获取软件用户详情
+func (C *AppUserFull) Info(c *gin.Context) {
+	var 请求 struct {
+		Id    int `json:"id"`
+		AppId int `json:"appId"`
+	}
+	if !C.ToJSON(c, &请求) {
+		return
+	}
+	if 请求.AppId < 10000 {
+		response.FailWithMessage("AppId请输>=10000的整数", c)
+		return
+	}
+
+	var DB_AppUser struct {
+		dbm.DB_AppUser
+		AppType int `json:"appType"`
+	}
+	db := *global.GVA_DB
+	err := db.Model(dbm.DB_AppUser{}).Table("db_AppUser_"+strconv.Itoa(请求.AppId)).Omit("app_type").Where("id = ?", 请求.Id).First(&DB_AppUser).Error
+	if err != nil {
+		response.FailWithMessage("查询软件用户详细信息失败", c)
+		return
+	}
+
+	app信息 := service.NewAppInfo(c, &db).App取App详情(请求.AppId)
+	DB_AppUser.AppType = app信息.AppType
+	response.OkWithDetailed(DB_AppUser, "获取成功", c)
+}
+
+// GetList 获取软件用户列表
+func (C *AppUserFull) GetList(c *gin.Context) {
+	var 请求 struct {
+		AppId         int    `json:"appId"`
+		Page          int    `json:"page"`
+		Size          int    `json:"size"`
+		Status        int    `json:"status"`
+		Type          int    `json:"type"`
+		Keywords      string `json:"keywords"`
+		Order         int    `json:"order"`
+		Sortable      int    `json:"sortable"`
+		IsLogin       int    `json:"isLogin"`
+		VipTimeStatus int    `json:"vipTimeStatus"`
+		UserClassId   int    `json:"userClassId"`
+		AgentUid      int    `json:"agentUid"`
+	}
+	if !C.ToJSON(c, &请求) {
+		return
+	}
+	if 请求.AppId < 10000 {
+		response.FailWithMessage("AppId请输>=10000的整数", c)
+		return
+	}
+
+	var DB_AppUser []DB_AppUser带User信息
+	var 总数 int64
+	var 表名_AppUser = "db_AppUser_" + strconv.Itoa(请求.AppId)
+	db := *global.GVA_DB
+	局_DB := db.Table(表名_AppUser)
+	if service.NewAppInfo(c, &db).App是否为卡号(请求.AppId) {
+		局_DB = 局_DB.Select(表名_AppUser+".*", "db_Ka.Name", "(select count(db_links_Token.id)  FROM db_links_Token WHERE  "+表名_AppUser+".Uid=db_links_Token.Uid AND db_links_Token.Status=1 AND LoginAppid="+strconv.Itoa(请求.AppId)+" )as LinksCount").Joins("left join db_Ka on " + 表名_AppUser + ".Uid=db_Ka.Id")
+	} else {
+		局_DB = 局_DB.Select(表名_AppUser+".*", "db_User.User", "(select count(db_links_Token.id)  FROM db_links_Token WHERE  "+表名_AppUser+".Uid=db_links_Token.Uid AND db_links_Token.Status=1 AND LoginAppid="+strconv.Itoa(请求.AppId)+" )as LinksCount").Joins("left join db_User on " + 表名_AppUser + ".Uid=db_User.Id")
+	}
+
+	var 排序字段名 = "Id"
+	switch 请求.Sortable {
+	case 1:
+		排序字段名 = "VipTime"
+	}
+	if 请求.Order == 1 {
+		局_DB.Order(表名_AppUser + "." + 排序字段名 + " ASC")
+	} else {
+		局_DB.Order(表名_AppUser + "." + 排序字段名 + " DESC")
+	}
+
+	var app信息 dbm.DB_AppInfo
+	app信息 = service.NewAppInfo(c, &db).App取App详情(请求.AppId)
+	switch 请求.VipTimeStatus {
+	case 1:
+		if app信息.AppType == 2 || app信息.AppType == 4 {
+			局_DB.Where(表名_AppUser+".VipTime > ?", 0)
+		} else {
+			局_DB.Where(表名_AppUser+".VipTime > ?", time.Now().Unix())
+		}
+	case 2:
+		if app信息.AppType == 2 || app信息.AppType == 4 {
+			局_DB.Where(表名_AppUser+".VipTime <= ?", 0)
+		} else {
+			局_DB.Where(表名_AppUser+".VipTime <= ?", time.Now().Unix())
+		}
+	case 3:
+		if app信息.AppType == 1 || app信息.AppType == 3 {
+			局_DB.Where(表名_AppUser+".VipTime > ?", time.Now().Unix())
+			局_DB.Where(表名_AppUser+".VipTime <= ?", time.Now().Unix()+86400)
+		}
+	case 4:
+		if app信息.AppType == 1 || app信息.AppType == 3 {
+			局_DB.Where(表名_AppUser+".VipTime > ?", time.Now().Unix())
+			局_DB.Where(表名_AppUser+".VipTime <= ?", time.Now().Unix()+(86400*3))
+		}
+	case 5:
+		if app信息.AppType == 1 || app信息.AppType == 3 {
+			局_DB.Where(表名_AppUser+".VipTime > ?", time.Now().Unix())
+			局_DB.Where(表名_AppUser+".VipTime <= ?", time.Now().Unix()+(86400*7))
+		}
+	case 6:
+		if app信息.AppType == 1 || app信息.AppType == 3 {
+			局_DB.Where(表名_AppUser+".VipTime > ?", time.Now().Unix())
+			局_DB.Where(表名_AppUser+".VipTime <= ?", time.Now().Unix()+(86400*30))
+		}
+	}
+
+	if 请求.Keywords != "" {
+		switch 请求.Type {
+		case 1:
+			局_DB.Where(表名_AppUser+".Id = ?", 请求.Keywords)
+		case 2:
+			局_DB.Where(表名_AppUser+".Uid = ?", 请求.Keywords)
+		case 3:
+			局_用户名数组 := utils.Z正则_取全部匹配子文本(请求.Keywords, "([A-Za-z0-9_]+)")
+			if service.NewAppInfo(c, &db).App是否为卡号(请求.AppId) {
+				if len(局_用户名数组) == 1 {
+					局_DB.Where(表名_AppUser+".Uid In ?", gorm.Expr("(Select Id from db_Ka where db_Ka.Name like ? )", "%"+文本_转义Like(请求.Keywords)+"%"))
+				} else {
+					局_DB.Where(表名_AppUser+".Uid In ?", gorm.Expr("(Select Id from db_Ka where db_Ka.Name IN ? )", 局_用户名数组))
+				}
+			} else {
+				if len(局_用户名数组) == 1 {
+					局_DB.Where(表名_AppUser+".Uid In ?", gorm.Expr("(Select Id from db_User where db_User.User  LIKE ? )", "%"+文本_转义Like(请求.Keywords)+"%"))
+				} else {
+					局_DB.Where(表名_AppUser+".Uid In ?", gorm.Expr("(Select Id from db_User where db_User.User IN ? )", 局_用户名数组))
+				}
+			}
+		case 4:
+			局_DB.Where("`Key` like ?", "%"+请求.Keywords+"%")
+		case 5:
+			局_DB.Where("LOCATE( ?, "+表名_AppUser+".Note)>0 ", 请求.Keywords)
+		case 6:
+			局_代理id := service.NewUser(c, &db).User用户名取id(请求.Keywords)
+			if 局_代理id == 0 {
+				局_代理id, _ = strconv.Atoi(请求.Keywords)
+			}
+			if 局_代理id == 0 {
+				局_代理id = -999
+			}
+			局_DB.Where("AgentUid = ?", 局_代理id)
+		case 7:
+			局_代理id含子级id := []int{}
+			局_代理id := service.NewUser(c, &db).User用户名取id(请求.Keywords)
+			if 局_代理id == 0 {
+				局_代理id, _ = strconv.Atoi(请求.Keywords)
+			}
+			if 局_代理id != 0 {
+				局_代理id含子级id = agent.L_agent.Q取下级代理数组含子级(c, []int{局_代理id})
+				局_代理id含子级id = append(局_代理id含子级id, 局_代理id)
+			}
+			if len(局_代理id含子级id) == 0 {
+				局_代理id含子级id = []int{-999}
+			}
+			局_DB.Where("AgentUid IN ?", 局_代理id含子级id)
+		case 8:
+			局_DB.Where("AgentUid = ?", utils.D到整数(请求.Keywords))
+		}
+	}
+
+	switch 请求.IsLogin {
+	case 1:
+		局_DB.Where("(select count(db_links_Token.id)  FROM db_links_Token WHERE  " + 表名_AppUser + ".Uid=db_links_Token.Uid AND db_links_Token.Status=1 AND LoginAppid=" + strconv.Itoa(请求.AppId) + " )>0 ")
+	case 2:
+		局_DB.Where("(select count(db_links_Token.id)  FROM db_links_Token WHERE  " + 表名_AppUser + ".Uid=db_links_Token.Uid AND db_links_Token.Status=1 AND LoginAppid=" + strconv.Itoa(请求.AppId) + " )=0 ")
+	}
+	if 请求.Status > 0 {
+		局_DB.Where(表名_AppUser+".Status = ? ", 请求.Status)
+	}
+	if 请求.UserClassId >= 0 {
+		局_DB.Where(表名_AppUser+".UserClassId = ? ", 请求.UserClassId)
+	}
+
+	err := 局_DB.Count(&总数).Limit(请求.Size).Offset((请求.Page - 1) * 请求.Size).Scan(&DB_AppUser).Error
+	if err != nil {
+		response.FailWithMessage("查询失败,参数异常"+err.Error(), c)
+		global.GVA_LOG.Println("GetAppUserList:" + err.Error())
+		return
+	}
+
+	UserClass := service.NewUserClass(c, &db).UserClass取map列表Int(请求.AppId)
+	type AppUserItem struct {
+		DB_AppUser带User信息
+		AgentName string `json:"agentName"`
+	}
+	var 局_list = make([]AppUserItem, 0, len(DB_AppUser))
+	for _, v := range DB_AppUser {
+		局_list = append(局_list, AppUserItem{DB_AppUser带User信息: v})
+	}
+
+	var 局_临时uid数组 []int
+	for _, v := range DB_AppUser {
+		if v.AgentUid > 0 {
+			局_临时uid数组 = append(局_临时uid数组, v.AgentUid)
+		}
+	}
+	if len(局_临时uid数组) > 0 {
+		局_临时uid数组 = utils.S数组_去重复(局_临时uid数组)
+		局_map := service.NewUser(c, &db).Id取User_批量(局_临时uid数组)
+		for i := range 局_list {
+			if 局_list[i].AgentUid > 0 {
+				if 局代理名称, ok := 局_map[局_list[i].AgentUid]; ok {
+					局_list[i].AgentName = 局代理名称
+				} else {
+					局_list[i].AgentName = "已删除用户"
+				}
+			}
+		}
+	}
+
+	response.OkWithDetailed(struct {
+		List      interface{}    `json:"list"`
+		Count     int64          `json:"count"`
+		AppType   int            `json:"appType"`
+		UserClass map[int]string `json:"userClass"`
+	}{局_list, 总数, app信息.AppType, UserClass}, "获取成功", c)
+}
+
+// New 新建软件用户
+func (C *AppUserFull) New(c *gin.Context) {
+	var 请求 struct {
+		AppId int `json:"appId"`
+		dbm.DB_AppUser
+	}
+	if !C.ToJSON(c, &请求) {
+		return
+	}
+	if 请求.AppId <= 0 {
+		response.FailWithMessage("AppId错误", c)
+		return
+	}
+	if 请求.Id > 0 {
+		response.FailWithMessage("添加用户不能有id值", c)
+		return
+	}
+
+	db := *global.GVA_DB
+	if service.NewAppInfo(c, &db).App是否为卡号(请求.AppId) {
+		if !service.NewKa(c, &db).KaId是否存在(请求.AppId, 请求.Uid) {
+			response.FailWithMessage("卡号Uid不存在,请先去[ 卡号列表 => 制新卡 ]添加信息", c)
+			return
+		}
+	} else {
+		if !service.NewUser(c, &db).UserId是否存在(请求.Uid) {
+			response.FailWithMessage("用户Uid不存在,请先去[ 用户管理 => 用户账户 ]添加该用户信息", c)
+			return
+		}
+		if agentLevel.L_agentLevel.Q取Id代理级别(c, 请求.Uid) > 0 {
+			response.FailWithMessage("禁止添加代理到软件用户", c)
+			return
+		}
+	}
+
+	var count int64
+
+	err := db.Model(dbm.DB_AppUser{}).Table("db_AppUser_"+strconv.Itoa(请求.AppId)).Where("Uid  = ?", 请求.Uid).Count(&count).Error
+	if count != 0 {
+		response.FailWithMessage("用户已存在", c)
+		return
+	}
+
+	局_信息 := dbm.DB_AppUser{
+		Uid:          请求.Uid,
+		Status:       请求.Status,
+		Key:          请求.Key,
+		VipTime:      请求.VipTime,
+		VipNumber:    请求.VipNumber,
+		Note:         请求.Note,
+		MaxOnline:    请求.MaxOnline,
+		UserClassId:  请求.UserClassId,
+		RegisterTime: time.Now().Unix(),
+	}
+
+	err = db.Model(dbm.DB_AppUser{}).Table("db_AppUser_" + strconv.Itoa(请求.AppId)).Create(&局_信息).Error
+	if err != nil {
+		response.FailWithMessage("添加失败", c)
+		return
+	}
+	response.OkWithMessage("添加成功", c)
+	if 局_信息.VipNumber != 0 {
+		go log.L_log.Log_写积分点数时间日志(service.NewAppUser(c, &db, 请求.AppId).Uid取User(请求.AppId, 请求.Uid), c.ClientIP(), fmt.Sprintf("管理员(%v),新增用户携带积分:%v", c.GetInt("Uid"), 局_信息.VipNumber), 局_信息.VipNumber, 请求.AppId, 1)
+	}
+}
+
+// SaveInfo 保存软件用户信息
+func (C *AppUserFull) SaveInfo(c *gin.Context) {
+	var 请求 struct {
+		AppId      int                 `json:"appId"`
+		AppUser    dbm.DB_AppUser      `json:"appUser"`
+		UserConfig []dbm.DB_UserConfig `json:"userConfig"`
+	}
+	if !C.ToJSON(c, &请求) {
+		return
+	}
+	if 请求.AppId < 10000 {
+		response.FailWithMessage("AppId请输>=10000的整数", c)
+		return
+	}
+	if 请求.AppUser.AgentUid != 0 && agentLevel.L_agentLevel.Q取Id代理级别(c, 请求.AppUser.AgentUid) == 0 {
+		response.FailWithMessage("归属代理id不正确", c)
+		return
+	}
+	if 请求.AppUser.Id <= 0 {
+		response.FailWithMessage("Id错误", c)
+		return
+	}
+
+	局_旧用户信息, err := appUser.B应用用户_保存管理员编辑(c, global.GVA_DB, 请求.AppId, 请求.AppUser, 请求.UserConfig)
+	db := *global.GVA_DB
+	if err != nil {
+		response.FailWithMessage("保存失败", c)
+		return
+	}
+
+	if 请求.AppUser.Status == 2 {
+		_ = service.NewLinksToken(c, &db).Set批量注销Uid数组([]int{局_旧用户信息.Uid}, 请求.AppId, constant.Z注销_管理员手动注销)
+	}
+	response.OkWithMessage("保存成功", c)
+	if 局_旧用户信息.VipNumber != 请求.AppUser.VipNumber {
+		go log.L_log.Log_写积分点数时间日志(service.NewAppUser(c, &db, 请求.AppId).Uid取User(请求.AppId, 请求.AppUser.Uid), c.ClientIP(), "管理员ID:"+strconv.Itoa(c.GetInt("Uid"))+"编辑用户信息积分变化:"+utils.Float64到文本(局_旧用户信息.VipNumber, 2)+"=>"+utils.Float64到文本(请求.AppUser.VipNumber, 2), 请求.AppUser.VipNumber-局_旧用户信息.VipNumber, 请求.AppId, 1)
+	}
+}
+
+// SetStatus 批量修改状态
+func (C *AppUserFull) SetStatus(c *gin.Context) {
+	var 请求 struct {
+		Id     []int  `json:"id"`
+		AppId  int    `json:"appId"`
+		Status int    `json:"status"`
+		Note   string `json:"note"`
+	}
+	if !C.ToJSON(c, &请求) {
+		return
+	}
+	if 请求.AppId <= 0 {
+		response.FailWithMessage("AppId错误", c)
+		return
+	}
+	if len(请求.Id) == 0 {
+		response.FailWithMessage("Id数组为空", c)
+		return
+	}
+	if 请求.Status != 1 && 请求.Status != 2 {
+		response.FailWithMessage("修改失败:Status状态代码错误", c)
+		return
+	}
+
+	err := appUser.L_appUser.Z置状态_同步卡号修改(c, 请求.AppId, 请求.Id, 请求.Status)
+	if err != nil {
+		response.FailWithMessage("修改失败", c)
+		return
+	}
+	db := *global.GVA_DB
+	if 请求.Status == 2 {
+		局_uid数组 := make([]int, 0, len(请求.Id))
+		for _, 值 := range 请求.Id {
+			局_uid数组 = append(局_uid数组, service.NewAppUser(c, &db, 请求.AppId).Id取Uid(请求.AppId, 值))
+		}
+		_ = service.NewLinksToken(c, &db).Set批量注销Uid数组(局_uid数组, 请求.AppId, constant.Z注销_管理员手动注销)
+	}
+	response.OkWithMessage("修改成功", c)
+}
+
+// SetBatchAddVipTime 批量增减时间点数
+func (C *AppUserFull) SetBatchAddVipTime(c *gin.Context) {
+	var 请求 struct {
+		Id     []int  `json:"id"`
+		AppId  int    `json:"appId"`
+		Status int    `json:"status"`
+		Note   string `json:"note"`
+	}
+	if !C.ToJSON(c, &请求) {
+		return
+	}
+	if 请求.AppId <= 0 {
+		response.FailWithMessage("AppId错误", c)
+		return
+	}
+	if len(请求.Id) == 0 {
+		response.FailWithMessage("Id数组为空", c)
+		return
+	}
+	var err error
+	db := *global.GVA_DB
+	if 请求.Status > 0 {
+		err = service.NewAppUser(c, &db, 请求.AppId).Id点数增减_批量(请求.Id, int64(请求.Status), true)
+	} else {
+		err = service.NewAppUser(c, &db, 请求.AppId).Id点数增减_批量(请求.Id, int64(-请求.Status), false)
+	}
+	if err != nil {
+		response.FailWithMessage("修改失败", c)
+		return
+	}
+	response.OkWithMessage("修改成功", c)
+	if 请求.Note == "" {
+		请求.Note = "无"
+	}
+	for _, 局_id := range 请求.Id {
+		log.L_log.Log_写积分点数时间日志(service.NewAppUser(c, &db, 请求.AppId).Id取User(请求.AppId, 局_id), c.ClientIP(), "管理员"+service.NewAdmin(c, &db).Id取User(c.GetInt("Uid"))+"批量增减点数,原因:"+请求.Note, float64(请求.Status), 请求.AppId, utils.S三元(service.NewAppInfo(c, &db).App是否为计点(请求.AppId), 2, 3))
+	}
+}
+
+// SetBatchAddVipNumber 批量增减积分
+func (C *AppUserFull) SetBatchAddVipNumber(c *gin.Context) {
+	var 请求 struct {
+		Id     []int   `json:"id"`
+		AppId  int     `json:"appId"`
+		Number float64 `json:"number"`
+		Note   string  `json:"note"`
+	}
+	if !C.ToJSON(c, &请求) {
+		return
+	}
+	if 请求.AppId <= 0 {
+		response.FailWithMessage("AppId错误", c)
+		return
+	}
+	if len(请求.Id) == 0 {
+		response.FailWithMessage("Id数组为空", c)
+		return
+	}
+	var err error
+	db := *global.GVA_DB
+	if 请求.Number > 0 {
+		err = service.NewAppUser(c, &db, 请求.AppId).Id积分增减_批量(请求.AppId, 请求.Id, 请求.Number, true)
+	} else {
+		err = service.NewAppUser(c, &db, 请求.AppId).Id积分增减_批量(请求.AppId, 请求.Id, utils.Float64取绝对值(请求.Number), false)
+	}
+	if err != nil {
+		response.FailWithMessage("修改失败", c)
+		return
+	}
+	response.OkWithMessage("修改成功", c)
+	if 请求.Note == "" {
+		请求.Note = "无"
+	}
+	for _, 局_id := range 请求.Id {
+		log.L_log.Log_写积分点数时间日志(service.NewAppUser(c, &db, 请求.AppId).Id取User(请求.AppId, 局_id), c.ClientIP(), "管理员"+service.NewAdmin(c, &db).Id取User(c.GetInt("Uid"))+"批量增减积分原因:"+请求.Note, 请求.Number, 请求.AppId, 1)
+	}
+}
+
+// SetBatchSetUserConfig 批量置云配置
+func (C *AppUserFull) SetBatchSetUserConfig(c *gin.Context) {
+	var 请求 struct {
+		Uids  []int  `json:"uids"`
+		AppId int    `json:"appId"`
+		Name  string `json:"name"`
+		Value string `json:"value"`
+	}
+	if !C.ToJSON(c, &请求) {
+		return
+	}
+	if 请求.AppId <= 0 {
+		response.FailWithMessage("AppId错误", c)
+		return
+	}
+	if len(请求.Uids) == 0 {
+		response.FailWithMessage("Uid数组为空", c)
+		return
+	}
+	if utils.W文本_删首尾空(请求.Name) == "" {
+		response.FailWithMessage("云配置名称不能为空", c)
+		return
+	}
+	db := *global.GVA_DB
+
+	局_map_id_user := make(map[int]string)
+	for _, 局_uid := range 请求.Uids {
+		局_User := service.NewAppUser(c, &db, 请求.AppId).Uid取User(请求.AppId, 局_uid)
+		if 局_User != "" {
+			局_map_id_user[局_uid] = 局_User
+		}
+	}
+
+	err := service.NewUserConfig(c, &db).P批量置值2(请求.AppId, 局_map_id_user, 请求.Name, 请求.Value)
+	if err != nil {
+		response.FailWithMessage("修改失败", c)
+		return
+	}
+	response.OkWithMessage("修改成功", c)
+}
+
+// SetBatchUserClass 批量修改用户类型
+func (C *AppUserFull) SetBatchUserClass(c *gin.Context) {
+	var 请求 struct {
+		Id          []int `json:"id"`
+		AppId       int   `json:"appId"`
+		UserClassId int   `json:"userClassId"`
+	}
+	if !C.ToJSON(c, &请求) {
+		return
+	}
+	if 请求.AppId <= 0 {
+		response.FailWithMessage("AppId错误", c)
+		return
+	}
+	if len(请求.Id) == 0 {
+		response.FailWithMessage("Id数组为空", c)
+		return
+	}
+	db := *global.GVA_DB
+	局_用户类型, ok := service.NewUserClass(c, &db).Id取详情(请求.AppId, 请求.UserClassId)
+	if !ok {
+		response.FailWithMessage("类型不存在", c)
+		return
+	}
+	局_数量, err := service.NewAppUser(c, &db, 请求.AppId).X修改用户类型_批量(请求.AppId, 请求.Id, 局_用户类型.Id)
+	if err != nil {
+		response.FailWithMessage("修改失败", c)
+		return
+	}
+	response.OkWithMessage("修改成功,数量:"+strconv.Itoa(int(局_数量)), c)
+}
+
+// SetBatchAllUserVipTime 全部用户增减时间点数
+func (C *AppUserFull) SetBatchAllUserVipTime(c *gin.Context) {
+	var 请求 struct {
+		AppId             int    `json:"appId"`
+		AddType           int    `json:"addType"`
+		Number            int64  `json:"number"`
+		UserVipTimeStatus int    `json:"userVipTimeStatus"`
+		UserPrefix        string `json:"userPrefix"`
+		OneLoginTimeStart int    `json:"oneLoginTimeStart"`
+		OneLoginTimeEnd   int    `json:"oneLoginTimeEnd"`
+		UserClassId       []int  `json:"userClassId"`
+	}
+	if !C.ToJSON(c, &请求) {
+		return
+	}
+	db := *global.GVA_DB
+	if 请求.AppId < 10000 || !service.NewAppInfo(c, &db).AppId是否存在(请求.AppId) {
+		response.FailWithMessage("AppId不存在", c)
+		return
+	}
+	if 请求.Number <= 0 {
+		response.FailWithMessage("修改值必须大于0", c)
+		return
+	}
+	switch 请求.AddType {
+	default:
+		response.OkWithMessage("操作类型错误", c)
+		return
+	case 1:
+		影响数量, err2 := appUser.L_appUser.P批量_全部用户增减时间或点数(c, 请求.AppId, 请求.Number, 请求.UserVipTimeStatus, 请求.UserPrefix, 请求.OneLoginTimeStart, 请求.OneLoginTimeEnd, 请求.UserClassId)
+		if err2 != nil {
+			response.FailWithMessage(err2.Error(), c)
+		} else {
+			response.OkWithMessage("操作成功,影响数量:"+strconv.Itoa(int(影响数量)), c)
+		}
+	case 2:
+		影响数量, err2 := appUser.L_appUser.P批量_全部用户增减时间或点数(c, 请求.AppId, -请求.Number, 请求.UserVipTimeStatus, 请求.UserPrefix, 请求.OneLoginTimeStart, 请求.OneLoginTimeEnd, 请求.UserClassId)
+		if err2 != nil {
+			response.FailWithMessage(err2.Error(), c)
+		} else {
+			response.OkWithMessage("操作成功,影响数量:"+strconv.Itoa(int(影响数量)), c)
+		}
+	case 3:
+		影响数量, err2 := appUser.L_appUser.P批量_全部用户修改为指定时间或点数(c, 请求.AppId, 请求.Number, 请求.UserVipTimeStatus, 请求.UserPrefix, 请求.OneLoginTimeStart, 请求.OneLoginTimeEnd, 请求.UserClassId)
+		if err2 != nil {
+			response.FailWithMessage(err2.Error(), c)
+		} else {
+			response.OkWithMessage("操作成功,影响数量:"+strconv.Itoa(int(影响数量)), c)
+		}
+	}
+}
+
+// GetBatchAllUserFilterResult 获取全部用户批量维护筛选结果
+func (C *AppUserFull) GetBatchAllUserFilterResult(c *gin.Context) {
+	var 请求 struct {
+		AppId             int    `json:"appId"`
+		UserVipTimeStatus int    `json:"userVipTimeStatus"`
+		UserPrefix        string `json:"userPrefix"`
+		OneLoginTimeStart int    `json:"oneLoginTimeStart"`
+		OneLoginTimeEnd   int    `json:"oneLoginTimeEnd"`
+		UserClassId       []int  `json:"userClassId"`
+	}
+	if !C.ToJSON(c, &请求) {
+		return
+	}
+
+	局_id数组, 局_uid数组, err := appUser.L_appUser.Q批量维护_按条件取用户Id和Uid(c, 请求.AppId, 请求.UserVipTimeStatus, 请求.UserPrefix, 请求.OneLoginTimeStart, 请求.OneLoginTimeEnd, 请求.UserClassId)
+	if err != nil {
+		response.FailWithMessage(err.Error(), c)
+		return
+	}
+	if len(局_id数组) == 0 {
+		response.OkWithDetailed(struct {
+			TaskId     string `json:"taskId"`
+			Count      int    `json:"count"`
+			UidPreview []int  `json:"uidPreview"`
+			HasMore    bool   `json:"hasMore"`
+		}{
+			TaskId:     "",
+			Count:      0,
+			UidPreview: []int{},
+			HasMore:    false,
+		}, "查询成功", c)
+		return
+	}
+
+	局_taskId := uuid.New().String()
+	global.H缓存.Set(批量维护全部用户_取缓存key(局_taskId), 结构_批量维护全部用户缓存{
+		AppId:   请求.AppId,
+		AdminId: c.GetInt("Uid"),
+		Id数组:    局_id数组,
+		Uid数组:   局_uid数组,
+		已执行:     false,
+		创建时间:    time.Now().Unix(),
+	}, time.Minute*30)
+
+	局_预览数量 := 100
+	if len(局_uid数组) < 局_预览数量 {
+		局_预览数量 = len(局_uid数组)
+	}
+	response.OkWithDetailed(struct {
+		TaskId     string `json:"taskId"`
+		Count      int    `json:"count"`
+		UidPreview []int  `json:"uidPreview"`
+		HasMore    bool   `json:"hasMore"`
+	}{
+		TaskId:     局_taskId,
+		Count:      len(局_uid数组),
+		UidPreview: 局_uid数组[:局_预览数量],
+		HasMore:    len(局_uid数组) > 局_预览数量,
+	}, "查询成功", c)
+}
+
+// SetBatchAllUserData 按筛选结果批量修改全部用户
+func (C *AppUserFull) SetBatchAllUserData(c *gin.Context) {
+	var 请求 struct {
+		TaskId         string  `json:"taskId"`
+		VipTimeType    int     `json:"vipTimeType"`
+		VipTimeValue   int64   `json:"vipTimeValue"`
+		VipNumberType  int     `json:"vipNumberType"`
+		VipNumberValue float64 `json:"vipNumberValue"`
+		NoteType       int     `json:"noteType"`
+		NoteValue      string  `json:"noteValue"`
+		MaxOnlineType  int     `json:"maxOnlineType"`
+		MaxOnlineValue int     `json:"maxOnlineValue"`
+		UserClassType  int     `json:"userClassType"`
+		UserClassId    int     `json:"userClassId"`
+		AgentUidType   int     `json:"agentUidType"`
+		AgentUidValue  int     `json:"agentUidValue"`
+	}
+	if !C.ToJSON(c, &请求) {
+		return
+	}
+	if 请求.TaskId == "" {
+		response.FailWithMessage("taskId不能为空", c)
+		return
+	}
+
+	局_缓存值, ok := global.H缓存.Get(批量维护全部用户_取缓存key(请求.TaskId))
+	if !ok {
+		response.FailWithMessage("筛选任务不存在或已过期,请重新查询", c)
+		return
+	}
+	局_缓存, ok := 局_缓存值.(结构_批量维护全部用户缓存)
+	if !ok {
+		response.FailWithMessage("筛选任务数据异常,请重新查询", c)
+		return
+	}
+	if 局_缓存.AdminId != c.GetInt("Uid") {
+		response.FailWithMessage("无权使用此筛选任务", c)
+		return
+	}
+	//if 局_缓存.已执行 {  //考虑到快速还原错误修改,已执行过的,也可以继续使用
+	//	response.FailWithMessage("该筛选任务已执行过修改,请重新查询", c)
+	//	return
+	//}
+	if len(局_缓存.Id数组) == 0 {
+		response.FailWithMessage("筛选结果为空,请重新查询", c)
+		return
+	}
+
+	局_是否有修改 := false
+	switch 请求.VipTimeType {
+	case 0:
+	case 1, 2:
+		if 请求.VipTimeValue <= 0 {
+			response.FailWithMessage("时间(点数)增减值必须大于0", c)
+			return
+		}
+		局_是否有修改 = true
+	case 3:
+		if 请求.VipTimeValue < 0 {
+			response.FailWithMessage("时间(点数)指定值不能小于0", c)
+			return
+		}
+		局_是否有修改 = true
+	default:
+		response.FailWithMessage("时间(点数)操作类型错误", c)
+		return
+	}
+
+	switch 请求.VipNumberType {
+	case 0:
+	case 1, 2:
+		if 请求.VipNumberValue <= 0 {
+			response.FailWithMessage("积分增减值必须大于0", c)
+			return
+		}
+		局_是否有修改 = true
+	case 3:
+		if 请求.VipNumberValue < 0 {
+			response.FailWithMessage("积分指定值不能小于0", c)
+			return
+		}
+		局_是否有修改 = true
+	default:
+		response.FailWithMessage("积分操作类型错误", c)
+		return
+	}
+
+	switch 请求.NoteType {
+	case 0:
+	case 1:
+		局_是否有修改 = true
+	case 2:
+		if 请求.NoteValue == "" {
+			response.FailWithMessage("追加备注内容不能为空", c)
+			return
+		}
+		局_是否有修改 = true
+	default:
+		response.FailWithMessage("备注操作类型错误", c)
+		return
+	}
+
+	switch 请求.MaxOnlineType {
+	case 0:
+	case 1, 2:
+		if 请求.MaxOnlineValue <= 0 {
+			response.FailWithMessage("最大同时在线数量增减值必须大于0", c)
+			return
+		}
+		局_是否有修改 = true
+	case 3:
+		if 请求.MaxOnlineValue <= 0 {
+			response.FailWithMessage("最大同时在线数量指定值必须大于0", c)
+			return
+		}
+		局_是否有修改 = true
+	default:
+		response.FailWithMessage("最大同时在线数量操作类型错误", c)
+		return
+	}
+
+	switch 请求.UserClassType {
+	case 0:
+	case 1:
+		局_是否有修改 = true
+	default:
+		response.FailWithMessage("用户类型操作错误", c)
+		return
+	}
+
+	switch 请求.AgentUidType {
+	case 0:
+	case 1:
+		if 请求.AgentUidValue < 0 {
+			response.FailWithMessage("归属代理Uid不能小于0", c)
+			return
+		}
+		if 请求.AgentUidType == 1 {
+			局_是否有修改 = true
+		}
+	default:
+		response.FailWithMessage("归属代理Uid操作类型错误", c)
+		return
+	}
+
+	if !局_是否有修改 {
+		response.FailWithMessage("请至少修改一项数据", c)
+		return
+	}
+
+	影响数量, err := appUser.L_appUser.P批量维护_按Id数组修改多个字段(c, 局_缓存.AppId, 局_缓存.Id数组, appUser.J结构_批量维护全部用户修改请求{
+		VipTimeType:    请求.VipTimeType,
+		VipTimeValue:   请求.VipTimeValue,
+		VipNumberType:  请求.VipNumberType,
+		VipNumberValue: 请求.VipNumberValue,
+		NoteType:       请求.NoteType,
+		NoteValue:      请求.NoteValue,
+		MaxOnlineType:  请求.MaxOnlineType,
+		MaxOnlineValue: 请求.MaxOnlineValue,
+		UserClassType:  请求.UserClassType,
+		UserClassId:    请求.UserClassId,
+		AgentUidType:   请求.AgentUidType,
+		AgentUidValue:  请求.AgentUidValue,
+	})
+	if err != nil {
+		response.FailWithMessage("修改失败:"+err.Error(), c)
+		return
+	}
+
+	局_缓存.已执行 = true
+	global.H缓存.Set(批量维护全部用户_取缓存key(请求.TaskId), 局_缓存, time.Minute*30)
+	response.OkWithDetailed(struct {
+		TaskId  string `json:"taskId"`
+		Count   int64  `json:"count"`
+		UidList []int  `json:"uidList"`
+	}{
+		TaskId:  请求.TaskId,
+		Count:   影响数量,
+		UidList: 局_缓存.Uid数组,
+	}, "修改成功", c)
+}
+
+// BatchSetAppUserKey 批量设置用户绑定信息
+func (C *AppUserFull) BatchSetAppUserKey(c *gin.Context) {
+	var 请求 struct {
+		AppId int    `json:"appId"`
+		Id    []int  `json:"id"`
+		Key   string `json:"key"`
+	}
+	if !C.ToJSON(c, &请求) {
+		return
+	}
+	db := *global.GVA_DB
+	if 请求.AppId < 10000 || !service.NewAppInfo(c, &db).AppId是否存在(请求.AppId) {
+		response.FailWithMessage("AppId不存在", c)
+		return
+	}
+	if len(请求.Id) <= 0 {
+		response.FailWithMessage("id数量必须大于0", c)
+		return
+	}
+	影响数量, err2 := service.NewAppUser(c, &db, 请求.AppId).X修改用户绑定信息_批量(请求.AppId, 请求.Id, 请求.Key)
+	if err2 != nil {
+		response.FailWithMessage(err2.Error(), c)
+	} else {
+		response.OkWithMessage("操作成功,影响数量:"+strconv.Itoa(int(影响数量)), c)
+	}
+}
+
+// BatchSetAppUserNote 批量修改备注
+func (C *AppUserFull) BatchSetAppUserNote(c *gin.Context) {
+	var 请求 struct {
+		AppId int    `json:"appId"`
+		Id    []int  `json:"id"`
+		Note  string `json:"note"`
+	}
+	if !C.ToJSON(c, &请求) {
+		return
+	}
+	db := *global.GVA_DB
+	if 请求.AppId < 10000 || !service.NewAppInfo(c, &db).AppId是否存在(请求.AppId) {
+		response.FailWithMessage("AppId不存在", c)
+		return
+	}
+	if len(请求.Id) <= 0 {
+		response.FailWithMessage("id数量必须大于0", c)
+		return
+	}
+	影响数量, err2 := service.NewAppUser(c, &db, 请求.AppId).X修改软件用户备注_批量(请求.AppId, 请求.Id, 请求.Note)
+	if err2 != nil {
+		response.FailWithMessage(err2.Error(), c)
+	} else {
+		response.OkWithMessage("操作成功,影响数量:"+strconv.Itoa(int(影响数量)), c)
+	}
+}
+
+// DeleteBatch 维护删除用户
+func (C *AppUserFull) DeleteBatch(c *gin.Context) {
+	var 请求 struct {
+		AppId int `json:"appId"`
+		Type  int `json:"type"`
+	}
+	if !C.ToJSON(c, &请求) {
+		return
+	}
+	db := *global.GVA_DB
+	if !service.NewAppInfo(c, &db).AppId是否存在(请求.AppId) {
+		response.FailWithMessage("AppId错误", c)
+		return
+	}
+	var 局_row int64
+	var err error
+	switch 请求.Type {
+	default:
+		response.FailWithMessage("维护类型错误", c)
+		return
+	case 1:
+		if service.NewAppInfo(c, &db).App是否为计点(请求.AppId) {
+			局_row, err = appUser.L_appUser.S删除VipTime小于等于X(c, 请求.AppId, 0)
+		} else {
+			局_row, err = appUser.L_appUser.S删除VipTime小于等于X(c, 请求.AppId, time.Now().Unix())
+		}
+	case 2:
+		if service.NewAppInfo(c, &db).App是否为计点(请求.AppId) {
+			局_row, err = appUser.L_appUser.S删除VipTime小于等于X且删除卡号(c, 请求.AppId, 0, c.ClientIP())
+		} else {
+			局_row, err = appUser.L_appUser.S删除VipTime小于等于X且删除卡号(c, 请求.AppId, time.Now().Unix(), c.ClientIP())
+		}
+	case 3:
+		局_row, err = appUser.L_appUser.S删除卡号不存在的软件用户(c, 请求.AppId)
+	}
+	if err != nil {
+		response.FailWithMessage("操作失败:"+err.Error(), c)
+		return
+	}
+	response.OkWithMessage("操作成功"+strconv.Itoa(int(局_row)), c)
+}
+
+// Delete 删除软件用户
+func (C *AppUserFull) Delete(c *gin.Context) {
+	var 请求 struct {
+		Id    []int `json:"id"`
+		AppId int   `json:"appId"`
+	}
+	if !C.ToJSON(c, &请求) {
+		return
+	}
+	if 请求.AppId < 10000 {
+		response.FailWithMessage("AppId请输>=10000的整数", c)
+		return
+	}
+	if len(请求.Id) == 0 {
+		response.FailWithMessage("Id数组为空", c)
+		return
+	}
+
+	var db = *global.GVA_DB
+	var 软件用户Uid = service.NewAppUser(c, &db, 请求.AppId).Id取Uid_批量(请求.AppId, 请求.Id)
+	var 影响行数 int64
+	// 分批删除AppUser，避免占位符超限
+	for i := 0; i < len(请求.Id); i += 5000 {
+		end := i + 5000
+		if end > len(请求.Id) {
+			end = len(请求.Id)
+		}
+		tx := db.Model(dbm.DB_AppUser{}).Table("db_AppUser_"+strconv.Itoa(请求.AppId)).Where("Id IN ? ", 请求.Id[i:end]).Delete("")
+		if tx.Error != nil {
+			response.FailWithMessage("删除失败", c)
+			return
+		}
+		影响行数 += tx.RowsAffected
+	}
+	// 分批删除UserConfig，避免占位符超限
+	for i := 0; i < len(软件用户Uid); i += 5000 {
+		end := i + 5000
+		if end > len(软件用户Uid) {
+			end = len(软件用户Uid)
+		}
+		_ = db.Model(dbm.DB_UserConfig{}).Where("AppId = ? ", 请求.AppId).Where("Uid IN ? ", 软件用户Uid[i:end]).Delete("").RowsAffected
+	}
+	response.OkWithMessage("删除成功,数量"+strconv.FormatInt(影响行数, 10), c)
+}

@@ -1,0 +1,171 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>插件管理</title>
+<style>
+  :root { --bg:#f5f6f8; --card:#fff; --line:#e3e6eb; --text:#1f2733; --sub:#6b7686; --main:#2f6fed; --ok:#18a058; --bad:#d03050; --warn:#b7791f; }
+  * { box-sizing:border-box; }
+  body { margin:0; padding:20px; background:var(--bg); color:var(--text); font:14px/1.6 system-ui,"PingFang SC","Microsoft YaHei",sans-serif; }
+  h1 { font-size:20px; margin:0 0 4px; }
+  .sub { color:var(--sub); font-size:13px; }
+  .bar { display:flex; flex-wrap:wrap; gap:10px; align-items:center; margin:16px 0; }
+  button { border:1px solid var(--line); background:#fff; color:var(--text); border-radius:6px; padding:5px 12px; cursor:pointer; font:inherit; }
+  button:hover { border-color:var(--main); color:var(--main); }
+  button.main { background:var(--main); border-color:var(--main); color:#fff; }
+  button.danger:hover { border-color:var(--bad); color:var(--bad); }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:10px; padding:16px; margin-bottom:12px; }
+  .head { display:flex; flex-wrap:wrap; gap:8px; align-items:baseline; }
+  .name { font-size:16px; font-weight:600; }
+  .tag { font-size:12px; padding:1px 8px; border-radius:10px; border:1px solid var(--line); color:var(--sub); }
+  .tag.ok { color:var(--ok); border-color:var(--ok); } .tag.bad { color:var(--bad); border-color:var(--bad); } .tag.warn { color:var(--warn); border-color:var(--warn); }
+  .err { color:var(--bad); background:#fdf0f3; border-radius:6px; padding:8px 10px; margin-top:8px; word-break:break-all; font-size:13px; }
+  .ops { display:flex; flex-wrap:wrap; gap:8px; margin-top:12px; }
+  .apps { margin-top:14px; border-top:1px dashed var(--line); padding-top:12px; }
+  .app { border:1px solid var(--line); border-radius:8px; padding:12px; margin-bottom:10px; }
+  .field { display:flex; flex-wrap:wrap; gap:6px 12px; align-items:center; margin-top:8px; }
+  .field label { min-width:120px; color:var(--sub); }
+  .field input[type=text], .field input[type=number], .field select, .field textarea { flex:1; min-width:200px; padding:5px 8px; border:1px solid var(--line); border-radius:6px; font:inherit; }
+  .field textarea { min-height:70px; }
+  .tip { flex-basis:100%; color:var(--sub); font-size:12px; }
+  #msg { position:fixed; top:16px; left:50%; transform:translateX(-50%); padding:8px 16px; border-radius:8px; color:#fff; background:var(--text); max-width:90vw; z-index:9; }
+  #msg.bad { background:var(--bad); } #msg.ok { background:var(--ok); }
+  .empty { text-align:center; color:var(--sub); padding:40px 0; }
+</style>
+</head>
+<body>
+<h1>插件管理</h1>
+<div class="sub">原生插件(.so)在宿主进程内以完整权限运行,等同于服务器权限。只安装你审核过源码、并用本宿主 SDK 编译的插件。</div>
+<div class="bar">
+  <button class="main" id="btnInstall">上传安装插件</button>
+  <button id="btnReload">刷新</button>
+  <span class="sub" id="sdk"></span>
+  <input type="file" id="file" accept=".so" hidden>
+</div>
+<div id="list"></div>
+<div id="msg" hidden></div>
+
+<script src="sdk.js"></script>
+<script>
+var 列表区 = document.getElementById('list'), 文件框 = document.getElementById('file'), 升级key = '';
+
+function el(标签, 属性, 子) {
+  var 节点 = document.createElement(标签);
+  for (var k in (属性 || {})) {
+    if (k === 'text') 节点.textContent = 属性[k];
+    else if (k === 'onclick') 节点.onclick = 属性[k];
+    else if (k === 'class') 节点.className = 属性[k];
+    else 节点[k] = 属性[k];
+  }
+  (子 || []).forEach(function (c) { if (c) 节点.appendChild(c); });
+  return 节点;
+}
+var 计时;
+function 提示(文本, 类型) {
+  var m = document.getElementById('msg');
+  m.textContent = 文本; m.className = 类型 || ''; m.hidden = false;
+  clearTimeout(计时); 计时 = setTimeout(function () { m.hidden = true; }, 类型 === 'bad' ? 8000 : 3000);
+}
+function 失败(e) { 提示(e.message || String(e), 'bad'); }
+function 时间(秒) { return 秒 ? new Date(秒 * 1000).toLocaleString() : '-'; }
+
+function 加载() {
+  kyplugin.host('getList').then(function (r) {
+    document.getElementById('sdk').textContent = '宿主 SDK 版本: ' + r.data.sdkVersion;
+    列表区.textContent = '';
+    if (!r.data.list.length) { 列表区.appendChild(el('div', { class: 'empty', text: '还没有安装插件' })); return; }
+    r.data.list.forEach(function (p) { 列表区.appendChild(插件卡片(p)); });
+  }).catch(失败);
+}
+
+function 插件卡片(p) {
+  var 应用区 = el('div', { class: 'apps', hidden: true });
+  var 标签 = [
+    el('span', { class: 'name', text: p.name }),
+    el('span', { class: 'tag', text: p.key }),
+    el('span', { class: 'tag', text: 'v' + (p.loadedVersion || p.version) }),
+    el('span', { class: 'tag ' + (p.status === 1 ? 'ok' : ''), text: p.status === 1 ? '已启用' : '已停用' }),
+    p.loaded ? null : el('span', { class: 'tag bad', text: '未加载' }),
+    p.pendingUpgrade ? el('span', { class: 'tag warn', text: '升级待重启生效' }) : null
+  ];
+  var 操作 = [
+    el('button', { text: '应用配置', onclick: function () { 切换应用区(p, 应用区); } }),
+    el('button', { text: p.status === 1 ? '停用' : '启用', onclick: function () {
+      kyplugin.host('setStatus', { key: p.key, status: p.status === 1 ? 2 : 1 }).then(function () { 提示('操作成功', 'ok'); 加载(); }).catch(失败);
+    } }),
+    el('button', { text: '升级', onclick: function () { 升级key = p.key; 文件框.value = ''; 文件框.click(); } })
+  ];
+  // 字段名大写开头: kyplugin.Menu 没有 json 标签(settings 的 Key/Type 同理)
+  (p.menus || []).forEach(function (m) {
+    操作.push(el('button', { text: m.Title || m.Path, onclick: function () { window.open('static/' + p.key + '/' + String(m.Path || '').replace(/^\/+/, ''), '_blank'); } }));
+  });
+  操作.push(el('button', { class: 'danger', text: '卸载', onclick: function () {
+    if (!confirm('确定卸载插件「' + p.name + '」?\n应用配置会被删除;插件自建的数据表(plg_' + p.key + '_*)保留。')) return;
+    kyplugin.host('uninstall', { key: p.key }).then(function (r) { 提示(r.msg, 'ok'); 加载(); }).catch(失败);
+  } }));
+  return el('div', { class: 'card' }, [
+    el('div', { class: 'head' }, 标签),
+    el('div', { class: 'sub', text: (p.description || '') + (p.author ? '  作者: ' + p.author : '') }),
+    el('div', { class: 'sub', text: '安装: ' + 时间(p.createTime) + '  更新: ' + 时间(p.updateTime) + '  sha256: ' + (p.sha256 || '').slice(0, 16) }),
+    p.loadError ? el('div', { class: 'err', text: '加载失败: ' + p.loadError }) : null,
+    el('div', { class: 'ops' }, 操作),
+    应用区
+  ]);
+}
+
+function 切换应用区(p, 区) {
+  if (!区.hidden) { 区.hidden = true; return; }
+  kyplugin.host('getAppList', { key: p.key }).then(function (r) {
+    区.textContent = '';
+    if (!r.data.list.length) 区.appendChild(el('div', { class: 'sub', text: '还没有应用' }));
+    r.data.list.forEach(function (a) { 区.appendChild(应用表单(p, a)); });
+    区.hidden = false;
+  }).catch(失败);
+}
+
+function 应用表单(p, a) {
+  var 开关 = el('input', { type: 'checkbox', checked: a.status === 1 });
+  var 取值 = {};
+  var 行 = [el('div', { class: 'field' }, [el('label', { text: '对该应用启用' }), 开关])];
+  (p.settings || []).forEach(function (f) {
+    var 值 = a.settings[f.Key] == null ? '' : a.settings[f.Key], 控件;
+    if (f.Type === 'switch') {
+      控件 = el('input', { type: 'checkbox', checked: 值 === '1' || 值 === 'true' });
+      取值[f.Key] = function () { return 控件.checked ? '1' : '0'; };
+    } else {
+      if (f.Type === 'select') {
+        控件 = el('select', {}, (f.Options || []).map(function (o) { return el('option', { value: o, text: o }); }));
+      } else if (f.Type === 'textarea') {
+        控件 = el('textarea');
+      } else {
+        控件 = el('input', { type: f.Type === 'number' ? 'number' : 'text' });
+      }
+      控件.value = 值;
+      取值[f.Key] = function () { return String(控件.value); };
+    }
+    行.push(el('div', { class: 'field' }, [el('label', { text: f.Label || f.Key }), 控件, f.Tip ? el('div', { class: 'tip', text: f.Tip }) : null]));
+  });
+  行.push(el('div', { class: 'ops' }, [el('button', { class: 'main', text: '保存', onclick: function () {
+    var 配置 = {};
+    for (var k in 取值) 配置[k] = 取值[k]();
+    kyplugin.host('saveApp', { key: p.key, appId: a.appId, status: 开关.checked ? 1 : 2, settings: 配置 })
+      .then(function () { 提示('保存成功', 'ok'); }).catch(失败);
+  } })]));
+  return el('div', { class: 'app' }, [el('div', { class: 'name', text: a.appName + ' (' + a.appId + ')' })].concat(行));
+}
+
+文件框.onchange = function () {
+  if (!文件框.files.length) return;
+  var 表单 = new FormData();
+  表单.append('file', 文件框.files[0]);
+  if (升级key) 表单.append('key', 升级key);
+  提示('上传中...');
+  kyplugin.upload(表单).then(function (r) { 提示(r.msg, 'ok'); 加载(); }).catch(失败);
+};
+document.getElementById('btnInstall').onclick = function () { 升级key = ''; 文件框.value = ''; 文件框.click(); };
+document.getElementById('btnReload').onclick = 加载;
+加载();
+</script>
+</body>
+</html>

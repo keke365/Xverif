@@ -1,0 +1,110 @@
+package service
+
+import (
+	"errors"
+	"gorm.io/gorm"
+	"server/app/global"
+	"server/app/models/dbm"
+	"server/app/models/request"
+	"server/app/utils"
+	"strconv"
+	"time"
+)
+
+type S_LogVipNumber struct{}
+
+func (s *S_LogVipNumber) Info(tx *gorm.DB, Id int) (dbm.DB_LogVipNumber, error) {
+	var value dbm.DB_LogVipNumber
+	err := tx.Model(dbm.DB_LogVipNumber{}).Where("Id = ?", Id).First(&value).Error
+	return value, err
+}
+
+type LogVipNumberListRequest struct {
+	request.List
+	LogType      int      `json:"LogType"`      // 1 积分 2 点数 3 时间
+	AppId        int      `json:"AppId"`        // 指定AppId
+	RegisterTime []string `json:"RegisterTime"` // 开始时间 结束时间
+}
+
+func (s *S_LogVipNumber) GetList(tx *gorm.DB, 请求 LogVipNumberListRequest) (int64, []dbm.DB_LogVipNumber, error) {
+	局_DB := tx.Model(dbm.DB_LogVipNumber{})
+	// 日期范围(起止均为当天0点的时间戳)，与代理端 GetListByUser 的过滤一致
+	if len(请求.RegisterTime) == 2 && 请求.RegisterTime[0] != "" && 请求.RegisterTime[1] != "" {
+		局_开始时间, _ := strconv.ParseInt(请求.RegisterTime[0], 10, 64)
+		局_结束时间, _ := strconv.ParseInt(请求.RegisterTime[1], 10, 64)
+		局_DB.Where("Time > ?", 局_开始时间).Where("Time < ?", 局_结束时间+86400)
+	}
+	if 请求.Order == 1 {
+		局_DB.Order("Id ASC")
+	} else {
+		局_DB.Order("Id DESC")
+	}
+	if 请求.Keywords != "" {
+		switch 请求.Type {
+		case 1: //用户名
+			局_DB.Where("User = ?", 请求.Keywords)
+		case 2: //消息
+			局_DB.Where("LOCATE(?, Note)>0", 请求.Keywords)
+		case 3: //ip
+			局_DB.Where("Ip = ?", 请求.Keywords)
+		}
+	}
+	//筛选积分还是点数 1 积分 2 点数 3时间
+	if 请求.LogType >= 1 && 请求.LogType <= 3 {
+		局_DB.Where("Type = ?", 请求.LogType)
+	}
+	if 请求.AppId > 0 {
+		局_DB.Where("AppId = ?", 请求.AppId)
+	}
+
+	var 总数 int64
+	if 请求.Count > 500000 {
+		总数 = 请求.Count
+	} else {
+		局_DB.Count(&总数)
+	}
+	var dataList []dbm.DB_LogVipNumber
+	err := 局_DB.Limit(请求.Size).Offset((请求.Page - 1) * 请求.Size).Find(&dataList).Error
+	if err != nil {
+		global.GVA_LOG.Println(utils.Q取包名结构体方法(s) + ":" + err.Error())
+	}
+	return 总数, dataList, err
+}
+
+// BatchDelete 批量删除日志
+func (s *S_LogVipNumber) BatchDelete(tx *gorm.DB, Id []int, Type int, Keywords string) (int64, error) {
+	var 影响行数 int64
+	var d = tx.Model(dbm.DB_LogVipNumber{})
+
+	if Type <= 0 || Type > 7 {
+		return 0, errors.New("Type错误")
+	}
+
+	switch Type {
+	case 1:
+		if len(Id) == 0 {
+			return 0, errors.New("Id数组没有要删除的ID")
+		}
+		影响行数 = d.Where("Id IN ?", Id).Delete(dbm.DB_LogVipNumber{}).RowsAffected
+	case 2:
+		影响行数 = d.Where("User = ?", Keywords).Delete(dbm.DB_LogVipNumber{}).RowsAffected
+	case 3: //清空 使用TRUNCATE瞬间完成,避免大表DELETE卡死
+		return 日志_整表TRUNCATE清空(tx, dbm.DB_LogVipNumber{})
+	case 4: //删除7天前 分批删除避免长时间锁表
+		return 日志_分批条件删除(tx, dbm.DB_LogVipNumber{}, "Time < ?", time.Now().Unix()-604800)
+	case 5: //删除30天前 分批删除避免长时间锁表
+		return 日志_分批条件删除(tx, dbm.DB_LogVipNumber{}, "Time < ?", time.Now().Unix()-2592000)
+	case 6: //删除90天前 分批删除避免长时间锁表
+		return 日志_分批条件删除(tx, dbm.DB_LogVipNumber{}, "Time < ?", time.Now().Unix()-7776000)
+	case 7:
+		if len(Keywords) == 0 {
+			return 0, errors.New("关键字不能为空")
+		}
+		影响行数 = d.Where("LOCATE(?, Note)>0", Keywords).Delete(dbm.DB_LogVipNumber{}).RowsAffected
+	}
+
+	if d.Error != nil {
+		return 0, d.Error
+	}
+	return 影响行数, nil
+}
